@@ -1,8 +1,10 @@
 # Telegram Saved Messages Bulk Forwarder
 
-A Python background worker that pulls media out of your **Saved Messages** and forwards it in 50-item batches to a designated channel/group — with no captions, conservative rate limiting, and a remote `/stop` command so you can halt it from any Telegram client.
+A Python **web service** that pulls media out of your **Saved Messages** and forwards it in 50-item batches to a designated channel/group — with no captions, conservative rate limiting, and a remote `/stop` command so you can halt it from any Telegram client.
 
-Built to run as a **Render Background Worker** (stateless host + StringSession auth), but works locally too.
+Built to run on **Render's free tier** (web service + StringSession auth + Telegram-mirrored state). Also works locally.
+
+> **Note on Render free tier:** background workers are paid-only, so this bot runs as a web service that binds to `$PORT` and serves a tiny HTTP status page. The bot still runs continuously; the HTTP server is just there to satisfy Render's platform health check. State is mirrored to your Saved Messages so redeploys/sleeps don't lose resume memory.
 
 ---
 
@@ -14,11 +16,12 @@ Built to run as a **Render Background Worker** (stateless host + StringSession a
 4. **Keeps albums together** — multi-photo posts are re-sent as a single `send_media_group` call.
 5. **Strips captions** — every item is forwarded with `caption=""`, so the destination is media-only.
 6. **Conservative rate limiting** — ~2.5s between messages, then a 2-3 minute pause after every 50.
-7. **Persists sent IDs** to `state.json`, so a crash / redeploy / restart will resume from where it left off without re-sending.
-8. **Stops on `/stop`** — send `/stop`, `/halt`, or `/kill` to your own Saved Messages from any Telegram client, and the watcher halts the bot after the current item.
+7. **Persists sent IDs** to `state.json` locally + mirrors to your Saved Messages as a document (so free-tier redeploys don't lose resume memory).
+8. **Stops on `/stop`** — send `/stop`, `/halt`, or `/kill` to your own Saved Messages, POST to `/stop` on the HTTP server, press Ctrl+C, or use Render's Suspend button — all halt the bot gracefully after the current item.
 9. After a full sweep, sleeps 5 min and re-scans — so newly saved items get picked up without a restart.
 10. **Live upload progress** — every item shows: sweep number, item number, message id, kind (photo/video/animation/album), per-upload byte progress (when a real upload is needed), cumulative totals, and items/min rate. Batch pauses show a live countdown bar.
 11. **Telegram-side live progress message** — the bot posts ONE message to your Saved Messages (or any chat you configure) and keeps editing it in place with the current sweep #, items sent, current item, upload %, batch-pause countdown, and cumulative totals. Send `/status` to the same chat for an on-demand snapshot.
+12. **HTTP status page** — Render's web service URL serves a human-readable status dashboard at `/`, JSON at `/status`, and accepts `POST /stop` to halt the bot. Useful for keeping the service awake with an external uptime monitor.
 
 ---
 
@@ -26,18 +29,20 @@ Built to run as a **Render Background Worker** (stateless host + StringSession a
 
 ```
 tg-bulk-forwarder/
-├── main.py              # CLI entrypoint + orchestration
-├── config.py            # Env vars + CLI flag merging
-├── forwarder.py         # Core loop: sweep → filter → send → mark_sent
-├── filters.py           # Photo / Video / Animation matcher
-├── progress.py          # Console live progress bars (sweep, item, upload, batch pause)
-├── telegram_progress.py # Telegram-side live progress message (in-place edits)
-├── rate_limiter.py      # Pacing + FloodWait auto-retry
-├── stop_signal.py       # Background thread polling Saved Messages for /stop & /status
-├── state.py             # state.json persistence (atomic writes)
-├── session_setup.py     # One-time local script → prints SESSION_STRING
-├── render.yaml          # Render Background Worker config
-├── Dockerfile           # Docker image (alternative to native Python runtime)
+├── main.py                  # CLI entrypoint + orchestration
+├── config.py                # Env vars + CLI flag merging
+├── forwarder.py             # Core loop: sweep → filter → send → mark_sent
+├── filters.py               # Photo / Video / Animation matcher
+├── progress.py              # Console live progress bars (sweep, item, upload, batch pause)
+├── telegram_progress.py     # Telegram-side live progress message (in-place edits)
+├── telegram_state_sync.py   # Mirror state.json to Saved Messages (free-tier persistence hack)
+├── web_server.py            # Tiny asyncio HTTP server on $PORT (/, /health, /status, /stop)
+├── rate_limiter.py          # Pacing + FloodWait auto-retry
+├── stop_signal.py           # Background thread polling Saved Messages for /stop & /status
+├── state.py                 # state.json persistence (atomic writes)
+├── session_setup.py         # One-time local script → prints SESSION_STRING
+├── render.yaml              # Render WEB SERVICE config (free tier)
+├── Dockerfile               # Docker image (alternative to native Python runtime)
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -108,53 +113,95 @@ To stop locally: either press `Ctrl+C`, or send `/stop` to your Saved Messages f
 
 ---
 
-## 4) Deploy to Render
+## 4) Deploy to Render (free tier — WEB SERVICE)
+
+> Render's free tier does **not** support background workers. This project runs as a **web service** instead — it binds to `$PORT` and serves a tiny HTTP server (just `/health`, `/status`, `/`, `/stop`) alongside the forwarding loop. The bot itself still runs continuously; the HTTP server is just there to satisfy Render's platform health check.
 
 ### Option A: Connect a GitHub repo (recommended)
 
 1. Push this folder to a GitHub repo.
-2. In Render Dashboard → **New** → **Background Worker**.
+2. In Render Dashboard → **New** → **Web Service**.
 3. Connect your GitHub repo.
 4. Render should auto-detect `render.yaml`. If not, set:
    - **Runtime**: Python 3
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `python main.py`
+   - **Plan**: Free
 5. Under **Environment**, set these required vars:
    - `API_ID` = (from step 1)
    - `API_HASH` = (from step 1)
    - `SESSION_STRING` = (from step 2)
    - `TARGET` = `@your_channel` or `-1001234567890`
 6. (Optional) Set the other env vars from `.env.example` to override defaults.
-7. Click **Create Background Worker**.
+7. Click **Create Web Service**.
+
+Render auto-sets `PORT` (usually 10000). The bot binds to `0.0.0.0:$PORT` within ~5 seconds of boot and serves `/health` → `OK` for the platform health check.
 
 ### Option B: Docker image
 
 Use the included `Dockerfile`:
-- Render → New → **Background Worker** → **Docker** runtime → point at the repo.
+- Render → New → **Web Service** → **Docker** runtime → point at the repo.
 - Same env vars as Option A.
 
-### Add a persistent disk (so `state.json` survives redeploys)
+### Why no persistent disk?
 
-Without a disk, Render's filesystem is ephemeral — `state.json` is wiped on every deploy, so resume won't work across redeploys.
+Render's free tier doesn't include persistent disks — `state.json` would be wiped on every deploy or sleep cycle. **The bot works around this by mirroring state.json as a document to your Saved Messages** (every 60s by default). On startup, the bot scans the latest `[BULK-FORWARDER-STATE]` document and restores its resume memory.
 
-1. In your Render service → **Disks** → **Add Disk**.
-2. Mount path: `/data`
-3. Size: 1 GB (smallest available — more than enough).
-4. Set `STATE_FILE=/data/state.json` in Environment.
+If you later upgrade to a paid Render plan with a Disk:
+1. Mount a 1GB disk at `/data`.
+2. Set `STATE_FILE=/data/state.json` and `PROGRESS_MESSAGE_ID_FILE=/data/progress_msg_id.txt`.
+3. Set `USE_TELEGRAM_STATE_SYNC=0` (no longer needed).
+
+---
+
+## 5) Render free-tier limitations & workarounds
+
+### The 15-minute sleep problem
+
+Render free web services **sleep after 15 minutes of no inbound HTTP traffic**. While sleeping, the bot is fully paused — no media gets forwarded.
+
+**Fix:** set up an external uptime monitor that pings your service every ~10 minutes:
+
+- [UptimeRobot](https://uptimerobot.com/) (free, 50 monitors)
+- [cron-job.org](https://cron-job.org/) (free)
+- [Better Stack](https://betterstack.com/) (free tier)
+
+Point it at `https://your-service.onrender.com/health` with HTTP 200 expected. The bot will be kept awake indefinitely.
+
+### The 750 instance-hours/month limit
+
+Render free tier includes 750 instance-hours/month (~31 days of always-on). With the uptime monitor workaround above, you'll likely hit this limit before the month ends. The bot will pause until the next billing cycle starts, then resume automatically.
+
+**Practical guidance:**
+- 750 hours ≈ enough to forward ~3,000-5,000 photos per month at conservative pacing.
+- If you need more, upgrade to Render's Starter plan ($7/month, always-on).
+
+### State persistence across redeploys
+
+The bot mirrors `state.json` to your Saved Messages as a JSON document every 60s. On startup, the latest mirror is restored. This means:
+
+- ✅ A redeploy keeps your resume memory.
+- ✅ A crash keeps your resume memory.
+- ✅ A Render sleep/wake cycle keeps your resume memory.
+- ⚠️ If you manually delete the state document from Saved Messages, the bot will start fresh next time.
+- ⚠️ If you change `TARGET`, the bot will ignore the old state doc (target mismatch).
+
+### Cold start delays
+
+When Render wakes the service, it takes ~30-60s to boot Python, install deps (if cached), connect to Telegram, and start forwarding. The HTTP `/health` endpoint is up within ~5s, so Render won't kill the service, but you'll see a brief delay before media starts flowing.
 
 ---
 
 ## Stopping the bot
 
-From **any** Telegram client (mobile, desktop, web):
+Four ways to halt:
 
-1. Open your own **Saved Messages** chat.
-2. Send `/stop` (or `/halt` or `/kill`).
-3. The background watcher polls Saved Messages every 5 seconds and halts the bot gracefully after the current item finishes.
+1. **Telegram** (any client): send `/stop`, `/halt`, or `/kill` to your own Saved Messages.
+2. **HTTP**: `curl -X POST https://your-service.onrender.com/stop` (or click the **Stop bot** button on the `/` status page).
+3. **Ctrl+C** when running locally.
+4. **Render's Suspend button** sends `SIGTERM`, which the bot handles the same way.
 
-The bot will reply "🛑 Stop signal received…" in your Saved Messages to confirm.
-
-You can also press `Ctrl+C` if running locally, or use Render's "Suspend" button — both send `SIGTERM`, which the bot handles the same way.
+In all cases, the bot finishes the current item, saves state, mirrors it to Saved Messages, posts a final "STOPPED" status message, then exits cleanly.
 
 ---
 
@@ -175,7 +222,14 @@ You can also press `Ctrl+C` if running locally, or use Render's "Suspend" button
 | `BATCH_PAUSE_MIN` | `120` | Min seconds pause after each batch |
 | `BATCH_PAUSE_MAX` | `180` | Max seconds pause after each batch |
 | `STOP_POLL_INTERVAL` | `5` | Seconds between Saved Messages polls for `/stop` |
-| `STATE_FILE` | `./state.json` | Path to sent-IDs state file |
+| `STATE_FILE` | `./state.json` | Path to local sent-IDs state file (ephemeral on free tier) |
+| `PORT` | (Render auto-sets) | HTTP server port — Render injects this automatically |
+| `TELEGRAM_PROGRESS` | `1` | `1`/`on` to post live progress to PROGRESS_CHAT |
+| `PROGRESS_CHAT` | `me` | Where live progress + `/stop` + `/status` commands are watched |
+| `PROGRESS_UPDATE_INTERVAL` | `5.0` | Min seconds between Telegram edits (≥2) |
+| `PROGRESS_MESSAGE_ID_FILE` | (next to STATE_FILE) | Persists live message_id so restart edits the same message |
+| `USE_TELEGRAM_STATE_SYNC` | `1` | Mirror state.json to PROGRESS_CHAT (essential on free tier) |
+| `STATE_SYNC_INTERVAL_SEC` | `60` | How often to push state.json to Telegram (≥30s) |
 
 ### CLI overrides
 
@@ -329,6 +383,32 @@ This means a Render redeploy won't spam your Saved Messages with duplicate progr
 ### Disabling
 
 If you don't want Telegram-side progress at all (e.g., you find it noisy), set `TELEGRAM_PROGRESS=0` or pass `--telegram-progress off`. You'll still see console progress bars in Render logs.
+
+---
+
+## HTTP status page & API
+
+When deployed, the bot serves a tiny HTTP server on Render's `$PORT`. Routes:
+
+| Method | Path | Returns | Use case |
+|---|---|---|---|
+| `GET` | `/` | HTML status dashboard (auto-refreshes every 10s) | Human-friendly view; click "Stop bot" button |
+| `GET` | `/health` | `OK` | Render platform health check (must respond within 60s of boot) |
+| `GET` | `/status` | JSON snapshot of current progress | Programmatic monitoring, external dashboards |
+| `POST` | `/stop` | `stop signal received…` | Halt the bot via curl/script |
+| `GET` | `/favicon.ico` | 204 No Content | Browser favicon suppression |
+
+Example:
+
+```bash
+# Check bot status from CLI
+curl https://your-service.onrender.com/status | jq .
+
+# Halt the bot from CLI
+curl -X POST https://your-service.onrender.com/stop
+```
+
+The `/` HTML page auto-refreshes every 10 seconds — leave it open in a browser tab for a live dashboard.
 
 ---
 

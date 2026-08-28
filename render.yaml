@@ -1,32 +1,37 @@
-# Render Background Worker — runs continuously, restarts on crash.
-# Docs: https://render.com/docs/background-workers
+# Render WEB SERVICE — required for free tier (background workers are paid-only).
 #
-# Deploy via Render Dashboard → New → Background Worker → connect this repo,
-# OR via `render deploy` from CLI with the render-cli.
+# Render auto-sets $PORT (usually 10000). The bot binds to 0.0.0.0:$PORT
+# and serves a tiny HTTP server with routes:
+#   GET  /           human-readable status page (HTML, auto-refresh)
+#   GET  /health     "OK" — Render's health check pings this
+#   GET  /status     JSON snapshot of current bot progress
+#   POST /stop       trigger graceful stop (same as /stop in Saved Messages)
+#
+# Render free tier notes:
+#   - Sleeps after 15 min of no inbound HTTP traffic → bot halts.
+#     Send a /status request every ~10 min from an external uptime monitor
+#     (cron-job.org, uptime-robot, etc.) to keep it awake.
+#   - No persistent disk → state.json + progress_msg_id.txt are wiped on
+#     redeploy. We work around this by mirroring state to your Saved Messages
+#     (USE_TELEGRAM_STATE_SYNC=1, on by default).
+#   - 750 instance-hours/month = ~31 days of always-on, but sleeps reset the
+#     counter — practical limit is much higher.
 #
 # Required env vars (set in Render Dashboard → Environment):
 #   API_ID          — from my.telegram.org
 #   API_HASH        — from my.telegram.org
 #   SESSION_STRING  — from running `python session_setup.py` locally
 #   TARGET          — @channel or -1001234567890
-#
-# Optional (defaults shown):
-#   FILTER=photo,video,animation
-#   ORDER=new
-#   BATCH_SIZE=50
-#   PER_MESSAGE_DELAY=2.5
-#   BATCH_PAUSE_MIN=120
-#   BATCH_PAUSE_MAX=180
-#   STATE_FILE=/data/state.json   ← mount a Render Disk at /data for persistence
 
 services:
-  - type: worker
+  - type: web
     name: tg-bulk-forwarder
     runtime: python
-    plan: starter               # cheapest paid plan; Render workers require paid
-    region: singapore            # change to your nearest region
+    plan: free                 # free tier — web service, sleeps after 15 min idle
+    region: singapore           # change to your nearest region
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+    healthCheckPath: /health   # Render pings this; must return 200 within 60s of boot
     autoDeploy: true
     envVars:
       - key: API_ID
@@ -42,28 +47,25 @@ services:
       - key: ORDER
         value: new
       - key: BATCH_SIZE
-        value: 50
+        value: "50"
       - key: PER_MESSAGE_DELAY
         value: "2.5"
       - key: BATCH_PAUSE_MIN
         value: "120"
       - key: BATCH_PAUSE_MAX
         value: "180"
-      - key: STATE_FILE
-        value: /data/state.json  # requires a Render Disk mounted at /data
-      - key: PYTHONUNBUFFERED
-        value: "1"               # ensures logs stream in real-time on Render
+      # State.json is wiped on every free-tier redeploy, so we mirror it
+      # to your Saved Messages by default. The next startup pulls it back.
+      - key: USE_TELEGRAM_STATE_SYNC
+        value: "1"
+      - key: STATE_SYNC_INTERVAL_SEC
+        value: "60"
       - key: TELEGRAM_PROGRESS
-        value: "1"               # post live progress to PROGRESS_CHAT
+        value: "1"
       - key: PROGRESS_CHAT
         value: me                # 'me' = Saved Messages; or @username / -100…
       - key: PROGRESS_UPDATE_INTERVAL
-        value: "5.0"             # seconds between Telegram edits (>=2)
-      # PROGRESS_MESSAGE_ID_FILE defaults to /data/progress_msg_id.txt (next to state.json)
-
-    # OPTIONAL: mount a persistent disk so state.json survives redeploys.
-    # Without this, your sent-id memory resets on each deploy.
-    disk:
-      - name: tgstate
-        mountPath: /data
-        sizeGB: 1                # 1GB is plenty for a JSON file
+        value: "5.0"
+      - key: PYTHONUNBUFFERED
+        value: "1"               # ensures logs stream in real-time on Render
+      # Render auto-sets PORT — do not override it here.

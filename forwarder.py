@@ -29,6 +29,8 @@ from rate_limiter import RateLimiter
 from state import State
 from stop_signal import StopWatcher
 from telegram_progress import Snapshot, TelegramProgress
+from telegram_state_sync import TelegramStateSync
+from web_server import WebServer
 
 
 Unit = Tuple[List[int], List[Message]]  # ([msg_id, ...], [Message, ...])
@@ -354,6 +356,8 @@ async def run_forwarder(
     stop_watcher: StopWatcher,
     limiter: RateLimiter,
     tp: TelegramProgress,
+    web: WebServer,
+    state_sync: TelegramStateSync | None = None,
     rescan_interval_sec: int = 300,
 ) -> None:
     """
@@ -369,6 +373,36 @@ async def run_forwarder(
         snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))
         return tp.status_snapshot_text(snap)
     stop_watcher.status_callback = _status_cb
+
+    # Wire web server status_provider so /status returns live JSON.
+    def _web_status_provider() -> dict:
+        snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))
+        # Convert Snapshot dataclass to dict for JSON serialization.
+        return {
+            "target": snap.target,
+            "filter_types": sorted(snap.filter_types),
+            "order": snap.order,
+            "sweep_num": snap.sweep_num,
+            "items_in_sweep": snap.items_in_sweep,
+            "msgs_in_sweep": snap.msgs_in_sweep,
+            "skipped_in_sweep": snap.skipped_in_sweep,
+            "total_items_sent": snap.total_items_sent,
+            "total_msgs_sent": snap.total_msgs_sent,
+            "total_skipped": snap.total_skipped,
+            "current_item_id": snap.current_item_id,
+            "current_item_kind": snap.current_item_kind,
+            "current_item_size": snap.current_item_size,
+            "upload_active": snap.upload_active,
+            "upload_current": snap.upload_current,
+            "upload_total": snap.upload_total,
+            "batch_pause_active": snap.batch_pause_active,
+            "batch_pause_remaining": snap.batch_pause_remaining,
+            "batch_num": snap.batch_num,
+            "stopped": snap.stopped,
+            "stop_reason": snap.stop_reason,
+            "state_sent_ids_count": len(state.sent_ids),
+        }
+    web.status_provider = _web_status_provider
 
     # Initial Telegram progress post.
     try:
@@ -387,6 +421,21 @@ async def run_forwarder(
             await asyncio.sleep(max(2.0, cfg.progress_update_interval))
     ticker_task = asyncio.create_task(_ticker(), name="tg-progress-ticker")
 
+    # Background task: periodic state-sync to Telegram so a free-tier redeploy
+    # doesn't lose resume memory.
+    async def _state_sync_ticker():
+        if state_sync is None:
+            return
+        while not stop_watcher.stop_requested():
+            await asyncio.sleep(cfg.state_sync_interval_sec)
+            if stop_watcher.stop_requested():
+                break
+            try:
+                await state_sync.sync(state.sent_ids)
+            except Exception as e:
+                print(f"[forwarder] state-sync tick failed: {e!r}")
+    sync_task = asyncio.create_task(_state_sync_ticker(), name="tg-state-sync-ticker")
+
     try:
         while not stop_watcher.stop_requested():
             try:
@@ -403,10 +452,12 @@ async def run_forwarder(
                 await asyncio.sleep(2)
     finally:
         ticker_task.cancel()
-        try:
-            await ticker_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        sync_task.cancel()
+        for t in (ticker_task, sync_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
         # Final update with stopped banner.
         stop_reason_holder["reason"] = stop_reason_holder.get("reason") or "Stopped by user / shutdown"
         try:

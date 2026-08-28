@@ -4,14 +4,18 @@ Main entrypoint.
 Usage (local):
     python main.py --target=@my_channel --filter=photo,video --order=new
 
-Usage (Render):
-    Set env vars (API_ID, API_HASH, SESSION_STRING, TARGET, FILTER, ORDER, …)
-    and the worker will pick them up automatically.
+Usage (Render free tier — WEB SERVICE, not background worker):
+    Set env vars (API_ID, API_HASH, SESSION_STRING, TARGET, FILTER, ORDER, …).
+    Render auto-sets $PORT; the bot binds to 0.0.0.0:$PORT and serves a tiny
+    HTTP server (/, /health, /status, /stop) alongside the forwarding loop.
+    State is mirrored to your Saved Messages so redeploys/sleeps don't lose
+    resume memory.
 
 Stop:
-    Send "/stop" (or "/halt" or "/kill") to your own Saved Messages from any
-    Telegram client. The watcher polls Saved Messages every 5s and halts the
-    bot gracefully after the current item.
+    - POST /stop       (HTTP)
+    - Send "/stop"     to your Saved Messages (Telegram)
+    - Ctrl+C           (local)
+    - Render 'Suspend' button (SIGTERM)
 """
 from __future__ import annotations
 
@@ -28,7 +32,9 @@ from forwarder import run_forwarder
 from rate_limiter import RateLimiter
 from state import State
 from stop_signal import StopWatcher
-from telegram_progress import TelegramProgress
+from telegram_progress import Snapshot, TelegramProgress
+from telegram_state_sync import TelegramStateSync
+from web_server import WebServer
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +57,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--progress-chat", help="Where to post live progress (default 'me' = Saved Messages).")
     p.add_argument("--progress-update-interval", type=float,
                    help="Min seconds between Telegram progress edits (default 5).")
+    p.add_argument("--web-port", type=int,
+                   help="HTTP server port (default $PORT or 10000).")
+    p.add_argument("--web-host", default="0.0.0.0",
+                   help="HTTP server bind host (default 0.0.0.0).")
+    p.add_argument("--use-telegram-state-sync", choices=["1","0","on","off"],
+                   help="Mirror state.json to a Telegram chat so free-tier redeploys don't lose progress. Default on.")
+    p.add_argument("--state-sync-interval", type=int,
+                   help="How often to push state.json to Telegram (default 60s).")
     p.add_argument("--rescan-interval", type=int, default=300,
                    help="Seconds between full Saved Messages rescans (default 300).")
     return p.parse_args()
@@ -73,6 +87,10 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
     if args.telegram_progress: o["telegram_progress"]   = args.telegram_progress
     if args.progress_chat:  o["progress_chat"]         = args.progress_chat
     if args.progress_update_interval: o["progress_update_interval"] = str(args.progress_update_interval)
+    if args.web_port:       o["web_port"]              = args.web_port
+    if args.web_host:       o["web_host"]              = args.web_host
+    if args.use_telegram_state_sync: o["use_telegram_state_sync"] = args.use_telegram_state_sync
+    if args.state_sync_interval: o["state_sync_interval_sec"]   = str(args.state_sync_interval)
     return o
 
 
@@ -86,6 +104,8 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     print(f"  batch_pause    : {cfg.batch_pause_min}-{cfg.batch_pause_max}s")
     print(f"  state_file     : {cfg.state_file}")
     print(f"  tg_progress    : {'on' if cfg.telegram_progress else 'off'} → {cfg.progress_chat!r} (every {cfg.progress_update_interval}s)")
+    print(f"  web_server     : http://{cfg.web_host}:{cfg.web_port}")
+    print(f"  state_sync     : {'on' if cfg.use_telegram_state_sync else 'off'} → {cfg.progress_chat!r} (every {cfg.state_sync_interval_sec}s)")
 
     # Build Pyrogram client from StringSession — no file I/O, perfect for Render.
     client = Client(
@@ -125,6 +145,23 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     if not cfg.telegram_progress:
         tp.disable()
 
+    # Telegram state-sync (mirrors state.json to Saved Messages so redeploys don't lose progress).
+    state_sync: TelegramStateSync | None = None
+    if cfg.use_telegram_state_sync:
+        state_sync = TelegramStateSync(
+            client=client, chat=cfg.progress_chat, target=cfg.target,
+        )
+
+    # Tiny HTTP server — Render free-tier requires binding to $PORT.
+    # Constructed now, started after Pyrogram connects.
+    web = WebServer(
+        port=cfg.web_port,
+        host=cfg.web_host,
+        # status_provider is wired after the tracker is created, in run_forwarder.
+        status_provider=lambda: {},
+        on_stop=stop_watcher.request_stop,
+    )
+
     # Ctrl+C handler — also flips the stop event.
     def _sigint(*_):
         print("\n[main] Ctrl+C received — requesting graceful stop after current item…")
@@ -137,17 +174,48 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     me = await client.get_me()
     print(f"[main] connected as {me.first_name} (@{me.username or '—'}) id={me.id}")
 
+    # Bootstrap state from Telegram (if enabled) — overrides local state.json
+    # if a Telegram state doc exists (it's the more durable copy on free tier).
+    if state_sync is not None:
+        try:
+            tg_sent_ids = await state_sync.bootstrap()
+            if tg_sent_ids:
+                # Merge: Telegram wins on conflict.
+                state.sent_ids = tg_sent_ids
+                state.save()
+                print(f"[main] restored {len(tg_sent_ids)} sent_ids from Telegram state doc")
+        except Exception as e:
+            print(f"[main] Telegram state-sync bootstrap failed: {e!r}; continuing with local state")
+
+    # Start the web server FIRST so Render's health check passes within 60s.
+    try:
+        await web.start()
+    except Exception as e:
+        print(f"[main] WARNING: web server failed to start: {e!r}")
+        print("[main] (Render will probably kill the service — ensure $PORT is set and not already in use)")
+
     # Start the /stop watcher.
     stop_watcher.start_background()
 
     try:
-        await run_forwarder(client, cfg, state, stop_watcher, limiter, tp,
+        await run_forwarder(client, cfg, state, stop_watcher, limiter, tp, web,
+                            state_sync=state_sync,
                             rescan_interval_sec=rescan_interval)
     finally:
         try:
             state.save()
         except Exception as e:
             print(f"[main] state save on exit failed: {e!r}")
+        # Final state sync to Telegram so the next startup has fresh data.
+        if state_sync is not None:
+            try:
+                await state_sync.sync(state.sent_ids)
+            except Exception as e:
+                print(f"[main] final Telegram state-sync failed: {e!r}")
+        try:
+            await web.stop()
+        except Exception:
+            pass
         try:
             await client.stop()
         except Exception:

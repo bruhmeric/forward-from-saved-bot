@@ -43,6 +43,14 @@ class Config:
     progress_update_interval: float = 5.0 # throttle (seconds between edits)
     progress_message_id_file: str = ""    # where to persist the live message_id
 
+    # Web server (Render free-tier requires binding to a port)
+    web_port: int = 10000               # Render sets $PORT; this is the fallback
+    web_host: str = "0.0.0.0"
+
+    # Telegram-synced state (works around Render free-tier having no persistent disk)
+    use_telegram_state_sync: bool = True
+    state_sync_interval_sec: int = 60   # how often to push state to Telegram
+
     def __post_init__(self) -> None:
         if self.order not in ("new", "old"):
             raise ValueError(f"ORDER must be 'new' or 'old', got {self.order!r}")
@@ -61,6 +69,11 @@ class Config:
             raise ValueError("PROGRESS_UPDATE_INTERVAL must be >= 2.0 seconds")
         if not self.progress_chat:
             raise ValueError("PROGRESS_CHAT must be set (use 'me' for Saved Messages)")
+        if self.web_port < 1 or self.web_port > 65535:
+            raise ValueError("PORT must be between 1 and 65535")
+        if self.state_sync_interval_sec < 30:
+            # Telegram rate-limits sending documents; keep >= 30s to be safe.
+            raise ValueError("STATE_SYNC_INTERVAL_SEC must be >= 30 seconds")
 
 
 def _parse_filter(raw: str) -> Set[str]:
@@ -96,6 +109,16 @@ def from_env(cli_overrides: dict | None = None) -> Config:
         base = os.path.dirname(os.path.abspath(state_file)) or "."
         progress_msg_file = os.path.join(base, "progress_msg_id.txt")
 
+    # Web server (Render free tier)
+    port_raw  = cli.get("web_port") or os.environ.get("PORT") or os.environ.get("WEB_PORT") or "10000"
+    web_port  = int(port_raw)
+    web_host  = cli.get("web_host") or os.environ.get("WEB_HOST") or "0.0.0.0"
+
+    # Telegram-synced state (works around Render free-tier having no persistent disk)
+    tsync_raw = (cli.get("use_telegram_state_sync") or os.environ.get("USE_TELEGRAM_STATE_SYNC") or "1").strip().lower()
+    use_telegram_state_sync = tsync_raw in ("1", "true", "yes", "on")
+    state_sync_interval_sec = int(cli.get("state_sync_interval_sec") or os.environ.get("STATE_SYNC_INTERVAL_SEC") or "60")
+
     if not api_id_raw:
         raise SystemExit("Missing API_ID. Set it in env or pass --api-id.")
     if not api_hash:
@@ -125,4 +148,8 @@ def from_env(cli_overrides: dict | None = None) -> Config:
         progress_chat=progress_chat,
         progress_update_interval=progress_interval,
         progress_message_id_file=progress_msg_file,
+        web_port=web_port,
+        web_host=web_host,
+        use_telegram_state_sync=use_telegram_state_sync,
+        state_sync_interval_sec=state_sync_interval_sec,
     )
