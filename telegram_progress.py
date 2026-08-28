@@ -144,7 +144,7 @@ class TelegramProgress:
             # Probe by trying to edit it. If it fails (deleted / too old / different chat),
             # we'll fall through and post a new one.
             try:
-                await self.client.edit_message_text(self.chat, existing, self.render(initial))
+                await self.client.edit_message(self.chat, existing, self.render(initial))
                 self.message_id = existing
                 print(f"[tg-progress] reusing message_id={existing}")
                 return
@@ -153,9 +153,9 @@ class TelegramProgress:
 
         # Post fresh.
         try:
-            sent = await self.client.send_message(self.chat, self.render(initial))
-            # Pyrogram's send_message returns a Message (or list of Message if split).
-            mid = sent.id if not isinstance(sent, list) else sent[0].id
+            sent = await self.client.send_message(self.chat, self.render(initial), link_preview=False)
+            # Telethon's send_message returns a single Message object.
+            mid = sent.id if sent else None
             self.message_id = mid
             self._save_message_id(mid)
             print(f"[tg-progress] posted live progress message (id={mid}) to chat={self.chat!r}")
@@ -181,7 +181,7 @@ class TelegramProgress:
     async def _do_edit(self, snap: Snapshot) -> None:
         async with self._edit_lock:
             try:
-                await self.client.edit_message_text(self.chat, self.message_id, self.render(snap))
+                await self.client.edit_message(self.chat, self.message_id, self.render(snap), link_preview=False)
                 self._last_edit_at = time.time()
             except Exception as e:
                 # If the message was deleted or chat is gone, disable silently.

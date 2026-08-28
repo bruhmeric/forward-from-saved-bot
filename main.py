@@ -25,7 +25,9 @@ import signal
 import sys
 from typing import Optional
 
-from pyrogram import Client
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 
 from config import Config, from_env
 from forwarder import run_forwarder
@@ -168,14 +170,11 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     print(f"  web_server     : http://{cfg.web_host}:{cfg.web_port}")
     print(f"  state_sync     : {'on' if cfg.use_telegram_state_sync else 'off'} → {cfg.progress_chat!r} (every {cfg.state_sync_interval_sec}s)")
 
-    # Build Pyrogram client from StringSession — no file I/O, perfect for Render.
-    client = Client(
-        name="bulk_forwarder",  # ignored when session_string provided
-        api_id=cfg.api_id,
-        api_hash=cfg.api_hash,
-        session_string=cfg.session_string,
-        no_updates=True,  # we don't need realtime updates; saves bandwidth
-        workdir="/tmp",    # avoid Render's read-only FS for transient stuff
+    # Build Telethon client from StringSession — no file I/O, perfect for Render.
+    client = TelegramClient(
+        StringSession(cfg.session_string),
+        cfg.api_id,
+        cfg.api_hash,
     )
 
     # State (sent IDs) — persisted file.
@@ -250,37 +249,38 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     signal.signal(signal.SIGINT, _sigint)
     signal.signal(signal.SIGTERM, _sigint)  # Render sends SIGTERM on shutdown
 
-    # Validate the session string format BEFORE attempting to start Pyrogram.
+    # Validate the session string format BEFORE attempting to start Telethon.
     # This catches the most common deployment mistake (pasting the value with
     # the 'SESSION_STRING=' prefix included, or wrapping in quotes, or copying
     # only part of it) and gives a friendly error instead of a cryptic
     # 'struct.error: unpack requires a buffer of 271 bytes'.
     _validate_session_string(cfg.session_string)
 
-    print("[main] starting Pyrogram client…")
+    print("[main] starting Telethon client…")
     try:
-        await client.start()
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Session not authorized — the SESSION_STRING is invalid or has been revoked.")
     except Exception as e:
-        # Pyrogram raises struct.error / KeyError / ValueError on bad sessions.
         msg = str(e)
         print()
         print("=" * 70)
-        print("❌ FAILED TO START PYROGRAM CLIENT")
+        print("❌ FAILED TO START TELETHON CLIENT")
         print("=" * 70)
         print(f"Error: {type(e).__name__}: {msg}")
         print()
         print("This is almost always a SESSION_STRING problem. Common causes:")
         print()
-        print("  1. SESSION_STRING was generated with a DIFFERENT Pyrogram version")
-        print("     (e.g. v1 vs v2). Re-run `python session_setup.py` locally with")
-        print("     the same pyrogram==2.0.106 version that's in requirements.txt.")
+        print("  1. SESSION_STRING was generated with a DIFFERENT library")
+        print("     (Telethon vs Pyrogram). Re-run `python session_setup.py` locally")
+        print("     — it now generates a TELETHON StringSession (not Pyrogram).")
         print()
         print("  2. SESSION_STRING was copy-pasted with extra characters (quotes,")
         print("     'SESSION_STRING=' prefix, trailing whitespace). We auto-strip")
         print("     common ones, but check the raw env var value on Render.")
         print()
-        print("  3. SESSION_STRING was truncated (Pyrogram v2 sessions are ~370")
-        print(f"     chars; yours is {len(cfg.session_string)} chars).")
+        print("  3. SESSION_STRING was truncated.")
+        print(f"     Yours is {len(cfg.session_string)} chars.")
         print()
         print("  4. The session was revoked (you logged out, or revoked it from")
         print("     Telegram's 'Active Sessions' page). Re-generate it.")
@@ -290,23 +290,25 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         raise SystemExit(1)
 
     me = await client.get_me()
-    print(f"[main] connected as {me.first_name} (@{me.username or '—'}) id={me.id}")
+    first_name = getattr(me, "first_name", None) or "?"
+    username = getattr(me, "username", None)
+    uid = getattr(me, "id", "?")
+    print(f"[main] connected as {first_name} (@{username or '—'}) id={uid}")
 
     # CRITICAL: Resolve the target peer BEFORE the forwarder starts sending.
-    # Without this, Pyrogram doesn't have an access_hash cached for the target
+    # Without this, Telethon doesn't have an access_hash cached for the target
     # channel/group, and every send will fail with:
-    #   PeerIdInvalid: [400 PEER_ID_INVALID] - The peer id being used is invalid or not known yet.
-    # Calling get_chat() once caches the access_hash in the in-memory session,
-    # so all subsequent copy_message / send_photo / etc. calls succeed.
+    #   PeerIdInvalidError: The peer id being used is invalid or not known yet.
+    # Calling get_entity() once caches the access_hash in the in-memory session,
+    # so all subsequent forward_messages calls succeed.
     print(f"[main] resolving target peer {cfg.target!r}…")
     try:
-        target_chat = await client.get_chat(cfg.target)
-        # Pyrogram's Chat object has different attr shapes; try several.
-        title = (getattr(target_chat, "title", None)
-                 or getattr(target_chat, "first_name", None)
-                 or getattr(target_chat, "username", None)
+        target_entity = await client.get_entity(cfg.target)
+        title = (getattr(target_entity, "title", None)
+                 or getattr(target_entity, "first_name", None)
+                 or getattr(target_entity, "username", None)
                  or "?")
-        cid = getattr(target_chat, "id", "?")
+        cid = getattr(target_entity, "id", "?")
         print(f"[main] ✓ target resolved: {title!r} (id={cid})")
     except Exception as e:
         print()
@@ -323,16 +325,12 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         print("     Join the channel from your Telegram app first, then redeploy.")
         print()
         print("  2. Target is a @username that doesn't exist or is misspelled.")
-        print("     Check the spelling — Telegram usernames are case-insensitive")
-        print("     but must match exactly otherwise.")
         print()
         print("  3. Target is a numeric id (-1001234567890) but you've never")
         print("     interacted with that chat from this account. Open it from")
         print("     your Telegram app once, then redeploy.")
         print()
         print("  4. For supergroups/channels, the id format MUST be -100<id>")
-        print("     (e.g., -1001234567890). Without the -100 prefix, Telegram")
-        print("     treats it as a user id and resolution fails.")
         print()
         raise SystemExit(1)
 
@@ -384,7 +382,7 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         except Exception:
             pass
         try:
-            await client.stop()
+            await client.disconnect()
         except Exception:
             pass
         print("[main] done.")

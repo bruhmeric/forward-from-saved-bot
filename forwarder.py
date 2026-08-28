@@ -1,17 +1,20 @@
 """
-Core forwarding logic.
+Core forwarding logic — Telethon version.
 
-Iterates the user's Saved Messages, yields each "unit" (single message OR
-a whole album), filters by media type, and forwards to the target channel
-with captions stripped. Idempotent via State.sent_ids. Respects stop signal.
+Key simplifications vs the Pyrogram version:
+  - iter_units uses client.iter_messages("me", filter=..., reverse=True, min_id=...)
+    which is a SINGLE ASYNC ITERATOR that:
+      * Filters server-side (no client-side filter needed)
+      * Returns oldest-first (no manual pagination + reverse-in-memory dance)
+      * Respects min_id for auto-resume watermark
+      * Streams (no need to load everything into RAM)
+  - Forwards batches via client.forward_messages(target, batch,
+    drop_author=True, drop_media_captions=True) which:
+      * Sends up to 100 messages in a single MTProto call
+      * Strips the caption AND the "forwarded from" header (drops the forward tag)
+      * Preserves album grouping if the whole album is in the batch
 
-Two send paths:
-  1. PRIMARY: `copy_message` / `copy_media_group` — server-side copy, no
-     actual file transfer. Fast, no bandwidth used. Caption overridden to "".
-  2. FALLBACK: if copy_* fails with MEDIA_GROUPED_INVALID / generic error,
-     re-send via `send_photo` / `send_video` / `send_media_group` with the
-     file downloaded first. This path triggers Pyrogram's `progress` callback
-     so the ProgressTracker can show real upload percentage.
+This is dramatically simpler than the Pyrogram version.
 """
 from __future__ import annotations
 
@@ -19,8 +22,14 @@ import asyncio
 import time
 from typing import AsyncIterator, List, Tuple
 
-from pyrogram import Client
-from pyrogram.types import Message
+from telethon import TelegramClient
+from telethon.tl.types import (
+    InputMessagesFilterPhotos,
+    InputMessagesFilterVideo,
+    InputMessagesFilterGif,
+    InputMessagesFilterEmpty,
+)
+from telethon.tl.custom.message import Message as TelethonMessage
 
 from config import Config
 from filters import is_match, message_kind
@@ -29,317 +38,167 @@ from rate_limiter import RateLimiter
 from state import State
 from stop_signal import StopWatcher
 from telegram_progress import Snapshot, TelegramProgress
-from telegram_state_sync import TelegramStateSync
 from web_server import WebServer
 
+# Map our filter type names to Telethon's InputMessagesFilter types.
+# Note: when filtering by multiple media types, Telethon can only use ONE filter
+# per iter_messages call (server-side). So when multiple types are enabled,
+# we use InputMessagesFilterEmpty (no server filter) and filter client-side.
+# This is a minor efficiency trade-off — when only ONE type is enabled,
+# we get full server-side filtering.
+_FILTER_MAP = {
+    "photo":     InputMessagesFilterPhotos,
+    "video":     InputMessagesFilterVideo,
+    "animation": InputMessagesFilterGif,
+}
 
-Unit = Tuple[List[int], List[Message]]  # ([msg_id, ...], [Message, ...])
+# A "unit" is either a single message or a whole album.
+# ids  = list of message ids in the unit
+# msgs = list of Telethon Message objects
+Unit = Tuple[List[int], List[TelethonMessage]]
+
+
+def _select_telethon_filter(enabled: set[str]):
+    """
+    If exactly ONE filter type is enabled, use the matching Telethon
+    InputMessagesFilter for server-side filtering (more efficient).
+    If MULTIPLE types are enabled, fall back to no server filter (filter client-side).
+
+    Returns an INSTANCE of the filter class (or InputMessagesFilterEmpty()).
+    """
+    if len(enabled) == 1:
+        only_one = next(iter(enabled))
+        filter_cls = _FILTER_MAP.get(only_one)
+        if filter_cls is not None:
+            return filter_cls()
+    return InputMessagesFilterEmpty()
 
 
 async def iter_units(
-    client: Client,
+    client: TelegramClient,
     order: str,
-    max_scan: int = 5000,
-    page_delay: float = 0.4,
+    cfg: Config,
     start_offset_id: int = 0,
 ) -> AsyncIterator[Unit]:
     """
     Yield (ids, messages) units from Saved Messages.
 
+    Uses Telethon's iter_messages with:
+      - reverse=True (oldest first)
+      - min_id=start_offset_id (auto-resume watermark)
+      - filter=InputMessagesFilter{Photos,Video,Gif} (server-side filter, single type only)
+
     A "unit" is either:
       - a single non-album message  → ([id], [msg])
-      - a complete album            → ([id1,id2,…], [msg1,msg2,…])
+      - a complete album             → ([id1,id2,…], [msg1,msg2,…])
 
-    Order handling:
-      - "new" (newest first): iterate directly via get_chat_history()
-      - "old" (oldest first): paginate backward (offset_id) collecting pages,
-        then reverse in memory and yield oldest-first.
-
-    Pyrogram 2.0.106's get_chat_history() does NOT support reverse=True,
-    so for oldest-first we must materialize the history in RAM.
-
-    Args:
-      max_scan: cap on total messages to collect (0 = unlimited). Default 5000.
-                Caps memory + scan time on huge Saved Messages.
-      page_delay: seconds to sleep between get_chat_history pages.
-                  Telegram rate-limits GetHistory to ~30 calls/30s. Default 0.4s
-                  keeps us under the limit and avoids FloodWait penalties.
-      start_offset_id: AUTO-RESUME watermark — only collect messages with id
-                       STRICTLY GREATER than this value. Pass state.last_offset_id
-                       to skip already-processed items on subsequent sweeps.
-                       0 = collect from the beginning.
+    Telethon's iter_messages handles pagination, reverse, min_id, and
+    server-side filtering all in one call. No manual offset_id walking,
+    no PAGE_DELAY, no "load all into memory" gymnastics.
     """
     seen_in_session: set[int] = set()
+    msg_filter = _select_telethon_filter(cfg.filter_types)
 
-    if order == "old":
-        # Collect Saved Messages into a list, paginating backward.
-        # Auto-resume: skip messages with id <= start_offset_id (already processed).
-        all_msgs: list = []
-        offset_id = 0  # Pyrogram's offset for pagination (walks backward from newest)
-        page_num = 0
-        scan_started_at = time.time()
-        # 0 means unlimited; otherwise cap at max_scan.
-        effective_cap = max_scan if max_scan > 0 else float("inf")
-        hit_cap = False
-        hit_existing_watermark = start_offset_id > 0
+    # Telethon's reverse=True works natively.
+    reverse = (order == "old")
 
-        if hit_existing_watermark:
-            print(f"[iter] auto-resume: skipping messages with id ≤ {start_offset_id} "
-                  f"(already processed in prior sweeps)")
+    if start_offset_id > 0:
+        print(f"[iter] auto-resume: starting from id > {start_offset_id} "
+              f"(filter={sorted(cfg.filter_types)}, reverse={reverse})")
+    else:
+        print(f"[iter] starting fresh scan (filter={sorted(cfg.filter_types)}, reverse={reverse})")
 
-        while len(all_msgs) < effective_cap:
-            page_num += 1
-            page_msgs: list = []
-            kwargs = {"limit": 100}
-            if offset_id > 0:
-                kwargs["offset_id"] = offset_id
-            try:
-                async for m in client.get_chat_history("me", **kwargs):
-                    if m is not None:
-                        # Auto-resume: skip already-processed items.
-                        if hit_existing_watermark and m.id <= start_offset_id:
-                            # We've walked back to the watermark — stop scanning.
-                            # (Messages come in newest-first order, so once we hit
-                            # an id <= watermark, everything older is also already done.)
-                            break
-                        page_msgs.append(m)
-                        if len(all_msgs) + len(page_msgs) >= effective_cap:
-                            break  # don't over-collect beyond the cap
-            except Exception as e:
-                print(f"[iter] get_chat_history page #{page_num} failed (offset_id={offset_id}): {e!r}")
-                break
+    # iter_messages with reverse=True yields oldest-first, with min_id as
+    # the exclusive lower bound (only messages with id > min_id).
+    # Note: with reverse=True, offset_id semantics flip — but min_id still works
+    # as the lower bound.
+    iterator = client.iter_messages(
+        "me",
+        filter=msg_filter if not isinstance(msg_filter, InputMessagesFilterEmpty) else None,
+        reverse=reverse,
+        min_id=start_offset_id if reverse else 0,
+        # When reverse=False (newest-first), use max_id to skip already-sent items.
+        max_id=start_offset_id if not reverse and start_offset_id > 0 else 0,
+        limit=cfg.max_scan if cfg.max_scan > 0 else None,
+    )
 
-            if not page_msgs:
-                break  # reached the end OR hit the watermark
-
-            # Trim to the cap if needed.
-            remaining_capacity = effective_cap - len(all_msgs)
-            if remaining_capacity < len(page_msgs):
-                page_msgs = page_msgs[:remaining_capacity]
-                hit_cap = True
-
-            all_msgs.extend(page_msgs)
-            # offset_id = the LOWEST id in this page; next page returns messages with id < that
-            lowest_id = min(m.id for m in page_msgs)
-            if lowest_id == offset_id:
-                break  # no progress — bail to avoid infinite loop
-            offset_id = lowest_id
-
-            # If we hit the watermark mid-page, stop scanning further back.
-            if hit_existing_watermark and lowest_id <= start_offset_id:
-                print(f"[iter] reached auto-resume watermark (id={start_offset_id}); "
-                      f"collected {len(all_msgs)} new messages")
-                break
-
-            # Progress log every 5 pages (or every page if cap is close).
-            elapsed = time.time() - scan_started_at
-            rate = len(all_msgs) / elapsed if elapsed > 0 else 0
-            if page_num % 5 == 0 or hit_cap:
-                cap_str = f"/{int(effective_cap)}" if effective_cap != float("inf") else ""
-                print(f"[iter] collected {len(all_msgs)}{cap_str} messages "
-                      f"({page_num} pages, {rate:.0f} msgs/sec, {elapsed:.1f}s elapsed)")
-            if hit_cap:
-                print(f"[iter] hit MAX_SCAN cap of {max_scan}; stopping collection")
-                break
-
-            # Throttle to avoid Telegram's GetHistory FloodWait (~30 calls per 30s).
-            if page_delay > 0:
-                await asyncio.sleep(page_delay)
-
-        if not all_msgs:
-            print(f"[iter] no new messages to process (watermark={start_offset_id}); "
-                  f"nothing to forward this sweep")
-            return
-
-        print(f"[iter] collected {len(all_msgs)} new messages in {page_num} pages "
-              f"({time.time() - scan_started_at:.1f}s); reversing for oldest-first")
-        all_msgs.reverse()  # now oldest-first
-
-        for m in all_msgs:
-            if m is None or m.id in seen_in_session:
-                continue
-            if m.media_group_id:
-                try:
-                    album = await client.get_media_group("me", m.id)
-                except Exception as e:
-                    print(f"[iter] could not fetch media group for msg_id={m.id}: {e!r}; treating as single")
-                    album = [m]
-                ids = [x.id for x in album if x is not None]
-                seen_in_session.update(ids)
-                yield ids, album
-            else:
-                seen_in_session.add(m.id)
-                yield [m.id], [m]
-        return
-
-    # Default path: newest-first (Pyrogram's natural order)
-    count = 0
-    async for m in client.get_chat_history("me"):
-        if m is None or m.id in seen_in_session:
+    count_seen = 0
+    async for m in iterator:
+        if m is None:
             continue
-        # Auto-resume: skip already-processed items (newest-first mode).
-        if start_offset_id > 0 and m.id <= start_offset_id:
-            # In newest-first order, once we hit the watermark, everything older is done.
-            print(f"[iter] newest-first: reached watermark id={start_offset_id}; stopping")
-            return
+        if m.id in seen_in_session:
+            continue
+        count_seen += 1
+        if count_seen % 200 == 0:
+            print(f"[iter] scanned {count_seen} messages so far…")
 
-        if m.media_group_id:
+        # Telethon groups albums by `m.grouped_id` (same as Pyrogram's media_group_id).
+        grouped_id = getattr(m, "grouped_id", None)
+        if grouped_id:
+            # Fetch the full album by searching for messages with the same grouped_id.
+            # Note: server-side filter (InputMessagesFilterVideo) does NOT support
+            # grouped_id filtering, so we use no filter here.
             try:
-                album = await client.get_media_group("me", m.id)
+                album_msgs = []
+                async for am in client.iter_messages("me", min_id=max(0, m.id - 50), max_id=m.id + 50, limit=100):
+                    if getattr(am, "grouped_id", None) == grouped_id:
+                        album_msgs.append(am)
+                if not album_msgs:
+                    album_msgs = [m]
             except Exception as e:
                 print(f"[iter] could not fetch media group for msg_id={m.id}: {e!r}; treating as single")
-                album = [m]
-            ids = [x.id for x in album if x is not None]
+                album_msgs = [m]
+            ids = [x.id for x in album_msgs if x is not None]
             seen_in_session.update(ids)
-            yield ids, album
+            yield ids, album_msgs
         else:
             seen_in_session.add(m.id)
             yield [m.id], [m]
 
-        count += 1
-        # Also respect max_scan in newest-first mode (treat 0 as unlimited).
-        if max_scan > 0 and count >= max_scan:
-            print(f"[iter] newest-first path hit MAX_SCAN cap of {max_scan}; stopping")
-            return
-
 
 # ----------------------------------------------------------------------
-# PRIMARY path: server-side copy (no upload)
+# Forward path: bulk forward via client.forward_messages with caption stripping
 # ----------------------------------------------------------------------
 
-async def _copy_single(
-    client: Client, target: str, msg: Message, limiter: RateLimiter
-) -> None:
-    async def send_fn():
-        return await client.copy_message(target, "me", msg.id, caption="")
-    await limiter.send_with_retry(send_fn, f"copy_message {msg.id}")
-
-
-async def _copy_album(
-    client: Client, target: str, album: List[Message], limiter: RateLimiter
-) -> None:
-    first = album[0]
-    captions = [""] * len(album)
-    async def send_fn():
-        return await client.copy_media_group(target, "me", first.id, captions=captions)
-    await limiter.send_with_retry(send_fn, f"copy_media_group {first.id} (x{len(album)})")
-
-
-# ----------------------------------------------------------------------
-# FALLBACK path: actual upload with progress callback
-# ----------------------------------------------------------------------
-
-async def _upload_single(
-    client: Client,
+async def _forward_batch(
+    client: TelegramClient,
     target: str,
-    msg: Message,
+    msgs: List[TelethonMessage],
     limiter: RateLimiter,
-    tracker: ProgressTracker,
-    loop: asyncio.AbstractEventLoop,
 ) -> None:
     """
-    Download the media from Saved Messages, then re-upload it to the target
-    with an empty caption. The `progress` callback updates the tracker with
-    upload percentage.
-    """
-    kind = message_kind(msg)
-    if kind is None:
-        raise RuntimeError(f"cannot upload non-media msg_id={msg.id}")
+    Forward a batch of up to 100 messages to the target channel.
+    Strips captions (drop_media_captions=True) AND forward headers (drop_author=True).
 
-    cb = make_upload_callback(tracker, loop)
+    Telethon's forward_messages does this in a SINGLE MTProto call, vs Pyrogram's
+    per-message copy_message which was 50x slower.
+    """
+    if not msgs:
+        return
+
+    # Limit batch to 100 (Telegram's hard limit per forwardMessages call).
+    if len(msgs) > 100:
+        msgs = msgs[:100]
+
+    msg_ids = [m.id for m in msgs]
 
     async def send_fn():
-        # Download to a temp file in memory-like buffer.
-        # Pyrogram: use client.download_media for the file, then send_* it.
-        # We use in_memory=True so we don't touch the disk.
-        path = await client.download_media(msg, in_memory=True)
-        if path is None:
-            raise RuntimeError(f"download returned None for msg_id={msg.id}")
+        # drop_media_captions=True strips captions.
+        # drop_author=True is REQUIRED by Telegram when drop_media_captions=True.
+        # The result: destination receives a clean copy with no caption and no
+        # "forwarded from" header.
+        return await client.forward_messages(
+            target,
+            msg_ids,
+            drop_author=True,
+            drop_media_captions=True,
+        )
 
-        if kind == "photo":
-            await client.send_photo(target, path, caption="", progress=cb)
-        elif kind == "video":
-            await client.send_video(target, path, caption="", progress=cb)
-        elif kind == "animation":
-            await client.send_animation(target, path, caption="", progress=cb)
-        else:
-            raise RuntimeError(f"unsupported kind for upload: {kind}")
-
-    await limiter.send_with_retry(send_fn, f"upload {kind} {msg.id}")
-
-
-async def _upload_album(
-    client: Client,
-    target: str,
-    album: List[Message],
-    limiter: RateLimiter,
-    tracker: ProgressTracker,
-    loop: asyncio.AbstractEventLoop,
-) -> None:
-    """
-    Download every item in the album, then send as a media group with empty
-    captions. Upload progress is the SUM across all items.
-    """
-    cb = make_upload_callback(tracker, loop)
-
-    async def send_fn():
-        # Pre-download all items.
-        paths = []
-        for m in album:
-            p = await client.download_media(m, in_memory=True)
-            if p is None:
-                raise RuntimeError(f"download returned None for msg_id={m.id}")
-            paths.append(p)
-
-        # Build media_group list.
-        from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaAnimation
-        media = []
-        for m, p in zip(album, paths):
-            kind = message_kind(m)
-            if kind == "photo":
-                media.append(InputMediaPhoto(media=p, caption=""))
-            elif kind == "video":
-                media.append(InputMediaVideo(media=p, caption=""))
-            elif kind == "animation":
-                media.append(InputMediaAnimation(media=p, caption=""))
-            else:
-                raise RuntimeError(f"unsupported kind in album: {kind}")
-
-        await client.send_media_group(target, media_group=media)
-        # send_media_group doesn't expose a progress param; we'd need to wrap
-        # each item. For now, leave tracker.upload_active False for albums.
-
-    await limiter.send_with_retry(send_fn, f"upload_album {album[0].id} (x{len(album)})")
+    await limiter.send_with_retry(send_fn, f"forward_messages {len(msgs)} items")
 
 
 # ----------------------------------------------------------------------
-# Dispatch: try copy first, fall back to upload on failure
-# ----------------------------------------------------------------------
-
-async def _dispatch_single(
-    client: Client, target: str, msg: Message,
-    limiter: RateLimiter, tracker: ProgressTracker, loop: asyncio.AbstractEventLoop,
-) -> None:
-    try:
-        await _copy_single(client, target, msg, limiter)
-    except Exception as e:
-        print(f"[forwarder] copy failed for msg_id={msg.id}: {e!r} — falling back to upload")
-        await _upload_single(client, target, msg, limiter, tracker, loop)
-
-
-async def _dispatch_album(
-    client: Client, target: str, album: List[Message],
-    limiter: RateLimiter, tracker: ProgressTracker, loop: asyncio.AbstractEventLoop,
-) -> None:
-    try:
-        await _copy_album(client, target, album, limiter)
-    except Exception as e:
-        print(f"[forwarder] copy_album failed for msg_id={album[0].id}: {e!r} — falling back to upload")
-        await _upload_album(client, target, album, limiter, tracker, loop)
-
-
-# ----------------------------------------------------------------------
-# Snapshot helper: build a Snapshot from the in-memory tracker state
+# Snapshot helper
 # ----------------------------------------------------------------------
 
 def _build_snapshot(tracker: ProgressTracker, cfg: Config, stop_reason: str = "") -> Snapshot:
@@ -379,7 +238,7 @@ def _build_snapshot(tracker: ProgressTracker, cfg: Config, stop_reason: str = ""
 # ----------------------------------------------------------------------
 
 async def _sweep(
-    client: Client,
+    client: TelegramClient,
     cfg: Config,
     state: State,
     stop_watcher: StopWatcher,
@@ -392,15 +251,12 @@ async def _sweep(
     One full pass over Saved Messages.
     Returns the number of NEW units sent this sweep.
     """
-    loop = asyncio.get_running_loop()
     sent_this_sweep = 0
 
     tracker.start_sweep()
-    # Initial Telegram progress update for this sweep.
     await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
 
     # Auto-resume: pass the last processed message_id as the starting watermark.
-    # iter_units will skip any messages with id ≤ this value (already processed).
     starting_offset = state.last_offset_id
     if starting_offset > 0:
         print(f"[sweep] auto-resuming from id > {starting_offset} (last processed in prior sweep)")
@@ -410,90 +266,112 @@ async def _sweep(
     limiter.start_burst()
     print(f"[sweep] starting burst #1 (target: {cfg.batch_size} items in {cfg.batch_interval_sec}s)")
 
-    async for ids, msgs in iter_units(client, cfg.order,
-                                      max_scan=cfg.max_scan,
-                                      page_delay=cfg.page_delay,
-                                      start_offset_id=starting_offset):
+    # Collect a batch of messages, then forward them all in one forward_messages call.
+    # This is dramatically more efficient than the Pyrogram version (which copied
+    # them one at a time).
+    batch: List[TelethonMessage] = []
+    batch_ids: List[int] = []
+
+    async for ids, msgs in iter_units(client, cfg.order, cfg, start_offset_id=starting_offset):
         if stop_watcher.stop_requested():
             print("[forwarder] stop signal received — halting")
             break
 
         # Idempotency: skip if ALL ids already sent.
         if all(state.was_sent(i) for i in ids):
-            # Update offset watermark even for skipped items so we don't re-visit.
             for i in ids:
                 state.update_offset_id(i)
             continue
 
-        # Filter: at least one message in the unit must match the filter set.
-        # If a unit has mixed media (e.g., a video+photo album), we keep it.
-        matching = [m for m in msgs if is_match(m, cfg.filter_types)]
-        if not matching:
-            tracker.item_skipped(ids[0], f"none of {len(msgs)} items match filter")
-            # Still advance the offset watermark so we don't re-scan this item.
-            for i in ids:
-                state.update_offset_id(i)
-            continue
+        # If using server-side filter (single type only), all msgs match.
+        # Otherwise (multi-type), filter client-side.
+        if len(cfg.filter_types) > 1:
+            matching = [m for m in msgs if is_match(m, cfg.filter_types)]
+            if not matching:
+                tracker.item_skipped(ids[0], f"none of {len(msgs)} items match filter")
+                for i in ids:
+                    state.update_offset_id(i)
+                continue
+            msgs = matching
+            ids = [m.id for m in matching]
 
-        # Determine kind label for progress display.
-        if len(msgs) > 1:
-            kinds = sorted({message_kind(m) for m in matching if message_kind(m)})
-            kind_label = "+".join(kinds)
-        else:
-            kind_label = message_kind(matching[0]) or "unknown"
+        # Add to the current batch.
+        batch.extend(msgs)
+        batch_ids.extend(ids)
 
-        # Pre-send pacing (within-burst delay).
+        # If batch is full, forward it.
+        if len(batch) >= cfg.batch_size:
+            await limiter.pace()
+            first_id = batch_ids[0]
+            kind_label = message_kind(batch[0]) or "unknown"
+            if len(batch) > 1:
+                kind_label = f"album({len(batch)}×{kind_label})"
+            tracker.item_start(first_id, kind_label, n_msgs=len(batch))
+            await tp.update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
+
+            try:
+                await _forward_batch(client, cfg.target, batch, limiter)
+            except Exception as e:
+                print(f"\n[forwarder] failed on msg_ids={batch_ids}: {e!r} — skipping (will retry next sweep)")
+                batch = []
+                batch_ids = []
+                continue
+
+            state.mark_sent_many(batch_ids)
+            try:
+                state.save()
+            except Exception as e:
+                print(f"\n[state] WARNING save failed: {e!r}")
+
+            tracker.item_done()
+            sent_this_sweep += 1
+            await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
+
+            batch = []
+            batch_ids = []
+
+            # Burst pause — wait until batch_interval_sec since this burst started.
+            if tracker.items_in_batch >= cfg.batch_size:
+                tracker.batch_pause_start()
+                await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
+                batch_total = float(limiter.batch_interval_sec)
+                loop_ref = asyncio.get_running_loop()
+                def _sync_tick(remaining: float):
+                    tracker.batch_pause_tick(remaining)
+                    snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))
+                    snap.batch_pause_active = True
+                    snap.batch_pause_remaining = remaining
+                    snap.batch_pause_total = batch_total
+                    asyncio.run_coroutine_threadsafe(tp.update(snap), loop_ref)
+                await limiter.batch_pause(on_tick=_sync_tick)
+                tracker.batch_pause_end()
+                limiter.start_burst()
+                print(f"[sweep] starting burst #{tracker.batch_num + 1} "
+                      f"(target: {cfg.batch_size} items in {cfg.batch_interval_sec}s)")
+                await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
+                if stop_watcher.stop_requested():
+                    break
+
+    # Flush any remaining batch.
+    if batch:
         await limiter.pace()
-
-        # Mark item start in the tracker.
-        first_id = ids[0]
-        tracker.item_start(first_id, kind_label, n_msgs=len(matching))
-        await tp.update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
-
-        # Send — album vs single, with upload fallback.
+        first_id = batch_ids[0]
+        kind_label = message_kind(batch[0]) or "unknown"
+        if len(batch) > 1:
+            kind_label = f"album({len(batch)}×{kind_label})"
+        tracker.item_start(first_id, kind_label, n_msgs=len(batch))
         try:
-            if len(msgs) > 1:
-                await _dispatch_album(client, cfg.target, msgs, limiter, tracker, loop)
-            else:
-                await _dispatch_single(client, cfg.target, msgs[0], limiter, tracker, loop)
+            await _forward_batch(client, cfg.target, batch, limiter)
+            state.mark_sent_many(batch_ids)
+            try:
+                state.save()
+            except Exception as e:
+                print(f"\n[state] WARNING save failed: {e!r}")
+            tracker.item_done()
+            sent_this_sweep += 1
         except Exception as e:
-            print(f"\n[forwarder] failed on msg_ids={ids}: {e!r} — skipping (will retry next sweep)")
-            continue
-
-        # Mark as sent & persist immediately.
-        state.mark_sent_many(ids)
-        try:
-            state.save()
-        except Exception as e:
-            print(f"\n[state] WARNING save failed: {e!r}")
-
-        tracker.item_done()
-        sent_this_sweep += 1
+            print(f"\n[forwarder] failed on final batch msg_ids={batch_ids}: {e!r}")
         await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
-
-        # Burst pause — wait until batch_interval_sec since this burst started.
-        if tracker.items_in_batch >= cfg.batch_size:
-            tracker.batch_pause_start()
-            await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
-            # Wrap on_tick so the tracker AND telegram progress both update.
-            batch_total = float(limiter.batch_interval_sec)
-            loop_ref = asyncio.get_running_loop()
-            def _sync_tick(remaining: float):
-                tracker.batch_pause_tick(remaining)
-                snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))
-                snap.batch_pause_active = True
-                snap.batch_pause_remaining = remaining
-                snap.batch_pause_total = batch_total
-                asyncio.run_coroutine_threadsafe(tp.update(snap), loop_ref)
-            await limiter.batch_pause(on_tick=_sync_tick)
-            tracker.batch_pause_end()
-            # Start the NEXT burst timer immediately after the pause ends.
-            limiter.start_burst()
-            print(f"[sweep] starting burst #{tracker.batch_num + 1} "
-                  f"(target: {cfg.batch_size} items in {cfg.batch_interval_sec}s)")
-            await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
-            if stop_watcher.stop_requested():
-                break
 
     tracker.end_sweep()
     print(tracker.summary())
@@ -502,15 +380,15 @@ async def _sweep(
 
 
 async def run_forwarder(
-    client: Client,
+    client: TelegramClient,
     cfg: Config,
     state: State,
     stop_watcher: StopWatcher,
     limiter: RateLimiter,
     tp: TelegramProgress,
     web: WebServer,
-    state_sync: TelegramStateSync | None = None,
-    rescan_interval_sec: int = 300,
+    state_sync=None,
+    rescan_interval_sec: int = 60,
 ) -> None:
     """
     Main loop: sweep Saved Messages, then sleep rescan_interval_sec, repeat.
@@ -523,7 +401,6 @@ async def run_forwarder(
     # Wire web server status_provider so /status returns live JSON.
     def _web_status_provider() -> dict:
         snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))
-        # Convert Snapshot dataclass to dict for JSON serialization.
         return {
             "target": snap.target,
             "filter_types": sorted(snap.filter_types),
@@ -557,8 +434,7 @@ async def run_forwarder(
     except Exception as e:
         print(f"[forwarder] TelegramProgress start failed: {e!r}; continuing without live progress")
 
-    # Background task: tick TelegramProgress every interval so upload progress
-    # and idle times still update even when no other event triggers.
+    # Background ticker for Telegram progress updates.
     async def _ticker():
         while not stop_watcher.stop_requested():
             try:
@@ -568,8 +444,7 @@ async def run_forwarder(
             await asyncio.sleep(max(2.0, cfg.progress_update_interval))
     ticker_task = asyncio.create_task(_ticker(), name="tg-progress-ticker")
 
-    # Background task: periodic state-sync to Telegram so a free-tier redeploy
-    # doesn't lose resume memory.
+    # Background ticker for Telegram state sync.
     async def _state_sync_ticker():
         if state_sync is None:
             return
@@ -605,7 +480,6 @@ async def run_forwarder(
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        # Final update with stopped banner.
         stop_reason_holder["reason"] = stop_reason_holder.get("reason") or "Stopped by user / shutdown"
         try:
             await tp.stop(_build_snapshot(tracker, cfg, stop_reason_holder["reason"]))

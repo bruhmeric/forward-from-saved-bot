@@ -11,7 +11,7 @@ Burst pacing model:
 This gives a steady ~50 items / 60 seconds throughput, which is what
 Telegram tolerates for sustained bulk sending to a single chat.
 
-Auto-retries on FloodWait by sleeping the requested duration + small jitter.
+Auto-retries on FloodWaitError by sleeping the requested duration + small jitter.
 """
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ import random
 import time
 from typing import Awaitable, Callable, TypeVar
 
-from pyrogram.errors import FloodWait
+# Telethon raises FloodWaitError (note: Error, not Wait).
+from telethon.errors import FloodWaitError
 
 T = TypeVar("T")
 
@@ -101,17 +102,17 @@ class RateLimiter:
         op_label: str = "send",
     ) -> T:
         """
-        Run send_fn() with FloodWait auto-retry.
-        Raises FloodWait if exceeded max_floodwait_retry.
+        Run send_fn() with FloodWaitError auto-retry.
+        Raises FloodWaitError if exceeded max_floodwait_retry.
         """
         last_err: Exception | None = None
         for attempt in range(1, self.max_floodwait_retry + 1):
             try:
                 return await send_fn()
-            except FloodWait as e:
-                # e.value is seconds Telegram asks us to wait.
-                wait = int(e.value) + 2  # +2s slack
-                print(f"[rate] FloodWait on {op_label}: must wait {e.value}s "
+            except FloodWaitError as e:
+                # Telethon: e.seconds is the wait time.
+                wait = int(e.seconds) + 2  # +2s slack
+                print(f"[rate] FloodWait on {op_label}: must wait {e.seconds}s "
                       f"(attempt {attempt}/{self.max_floodwait_retry})")
                 last_err = e
                 # Sleep in chunks so we can be interrupted cleanly.

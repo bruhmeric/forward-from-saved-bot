@@ -1,5 +1,5 @@
 """
-Telegram-synced state persistence.
+Telegram-synced state persistence — Telethon version.
 
 On Render's free tier, there's no persistent disk — `state.json` gets wiped
 on every redeploy, sleep cycle, or service restart. To work around this,
@@ -12,28 +12,17 @@ Flow:
   - After every N items sent (or every M minutes), re-post the current state
     as a fresh document, then delete the previous one to keep the chat clean.
 
-The state message is a JSON document with:
-  {
-    "target": "@somechannel",
-    "sent_ids": [101, 102, ...],
-    "schema_version": 1,
-    "updated_at": "2024-01-01T12:34:56Z"
-  }
-
 If both local state.json AND Telegram state exist, Telegram wins (it's the
 more durable copy on free tier).
 """
 from __future__ import annotations
 
-import asyncio
-import io
 import json
 import re
-import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from pyrogram import Client
+from telethon import TelegramClient
 
 # Magic prefix that identifies our state-sync document in the chat.
 # Stored as the message caption.
@@ -54,7 +43,7 @@ class TelegramStateSync:
 
     def __init__(
         self,
-        client: Client,
+        client: TelegramClient,
         chat: str = "me",
         target: str = "",
         max_history_messages: int = 50,
@@ -78,7 +67,7 @@ class TelegramStateSync:
         """
         print(f"[state-sync] scanning {self.chat!r} for latest state document…")
         try:
-            async for msg in self.client.get_chat_history(self.chat, limit=self.max_history_messages):
+            async for msg in self.client.iter_messages(self.chat, limit=self.max_history_messages):
                 if not self._is_state_message(msg):
                     continue
                 # Found the latest one.
@@ -97,13 +86,15 @@ class TelegramStateSync:
     def _is_state_message(self, msg) -> bool:
         if msg is None:
             return False
-        # The state doc is posted as a document with a caption starting with STATE_TAG.
-        if not msg.document:
+        # Telethon: msg.document is None for non-document messages.
+        if not getattr(msg, "document", None):
             # Also accept text messages with the tag (legacy / very small state).
-            if msg.text and STATE_TAG_RE.search(msg.text):
+            text = getattr(msg, "message", None) or ""
+            if STATE_TAG_RE.search(text):
                 return True
             return False
-        caption = msg.caption or ""
+        # msg.message in Telethon is the caption (or text).
+        caption = getattr(msg, "message", None) or ""
         if not STATE_TAG_RE.search(caption):
             return False
         return True
@@ -111,16 +102,15 @@ class TelegramStateSync:
     async def _download_state_from(self, msg) -> Optional[set[int]]:
         """Download and parse the state JSON from a state-sync message."""
         try:
-            buf = await self.client.download_media(msg, in_memory=True)
+            buf = await self.client.download_media(msg, file=bytes)
             if buf is None:
                 return None
-            # buf is a bytes-like object (BytesIO).
-            if hasattr(buf, "getvalue"):
-                data_bytes = buf.getvalue()
-            elif isinstance(buf, (bytes, bytearray)):
+            # Telethon returns bytes when file=bytes is specified.
+            if isinstance(buf, (bytes, bytearray)):
                 data_bytes = bytes(buf)
+            elif hasattr(buf, "read"):
+                data_bytes = buf.read()
             else:
-                # Assume file-like path
                 data_bytes = open(buf, "rb").read()
             data = json.loads(data_bytes.decode("utf-8"))
             # Target mismatch → discard (different destination).
@@ -143,7 +133,7 @@ class TelegramStateSync:
         Post the current state as a new document; delete the previous one.
         Throttle: caller should rate-limit (e.g., once per minute).
         """
-        if not self.client.is_connected:
+        if not self.client.is_connected():
             return
 
         data = {
@@ -154,23 +144,26 @@ class TelegramStateSync:
             "count": len(sent_ids),
         }
         try:
-            buf = io.BytesIO(json.dumps(data, indent=2).encode("utf-8"))
-            buf.name = "state.json"
+            data_bytes = json.dumps(data, indent=2).encode("utf-8")
             caption = (
                 f"{STATE_TAG}\n"
                 f"target={self.target}\n"
                 f"sent_ids={len(sent_ids)}\n"
                 f"updated={data['updated_at']}"
             )
-            # Post new state document.
-            sent = await self.client.send_document(
-                self.chat, document=buf, caption=caption,
+            # Telethon: send_file with file=bytes uploads in-memory bytes.
+            # force_document=True ensures it's sent as a generic file, not a photo.
+            sent = await self.client.send_file(
+                self.chat,
+                file=data_bytes,
+                force_document=True,
+                caption=caption,
             )
-            new_id = sent.id if not isinstance(sent, list) else sent[0].id
+            new_id = sent.id if sent else None
             # Delete previous one (if any).
             if self._latest_state_msg_id is not None and self._latest_state_msg_id != new_id:
                 try:
-                    await self.client.delete_messages(self.chat, self._latest_state_msg_id)
+                    await self.client.delete_messages(self.chat, [self._latest_state_msg_id])
                 except Exception as e:
                     print(f"[state-sync] could not delete previous state msg_id={self._latest_state_msg_id}: {e!r}")
             self._latest_state_msg_id = new_id

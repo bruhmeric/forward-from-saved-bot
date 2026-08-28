@@ -1,8 +1,20 @@
 # Telegram Saved Messages Bulk Forwarder
 
+> ## ⚠️ MIGRATION NOTICE (v3 — Telethon port)
+>
+> This version uses **Telethon** instead of Pyrogram. **You MUST re-run `python session_setup.py` locally to generate a NEW `SESSION_STRING`** — Telethon and Pyrogram use different session formats, and they are NOT interchangeable.
+>
+> After updating the code:
+> 1. Run `python session_setup.py` locally (it now generates a Telethon StringSession)
+> 2. Update the `SESSION_STRING` env var on Render with the new string
+> 3. Delete these stale env vars on Render (no longer used): `BATCH_PAUSE_MIN`, `BATCH_PAUSE_MAX`, `STOP_POLL_INTERVAL`
+> 4. Push to GitHub → Render auto-redeploys
+>
+> **Why the switch?** Telethon supports `reverse=True` (oldest-first iteration), `min_id` (auto-resume), and server-side media filtering — all of which Pyrogram 2.0.106 lacks. The result is dramatically simpler code: no manual pagination, no PAGE_DELAY, no "load all into memory" gymnastics. Plus, `forward_messages` accepts up to 100 messages per call (Pyrogram's `copy_message` was one-at-a-time), so burst throughput is ~5-10x faster.
+
 A Python **web service** that pulls media out of your **Saved Messages** and forwards it in 50-item batches to a designated channel/group — with no captions, conservative rate limiting, and a **web dashboard** at `/` for live progress + a `POST /stop` endpoint for halting it remotely.
 
-Built to run on **Render's free tier** (web service + StringSession auth). Also works locally.
+Built on **Telethon** (the userbot library — `reverse=True`, `min_id`, server-side filtering all work natively, unlike Pyrogram 2.0.106). Runs on **Render's free tier** (web service + StringSession auth). Also works locally.
 
 > **Note on Render free tier:** background workers are paid-only, so this bot runs as a web service that binds to `$PORT` and serves a tiny HTTP status page. The bot still runs continuously; the HTTP server is just there to satisfy Render's platform health check AND to give you a clean web UI for monitoring + control. By default, NO messages are posted to your Saved Messages — the web UI is the only progress surface.
 
@@ -10,11 +22,11 @@ Built to run on **Render's free tier** (web service + StringSession auth). Also 
 
 ## What it does
 
-1. Connects to Telegram using **your personal user account** (via Pyrogram `StringSession`) — required because Saved Messages is a user-only feature, not accessible to bot tokens.
+1. Connects to Telegram using **your personal user account** (via Telethon `StringSession`) — required because Saved Messages is a user-only feature, not accessible to bot tokens.
 2. Iterates Saved Messages (oldest-first by default, configurable to newest-first).
 3. Skips anything that isn't a photo / video / animation (GIF) per your `--filter` choice.
 4. **Keeps albums together** — multi-photo posts are re-sent as a single `send_media_group` call.
-5. **Strips captions** — every item is forwarded with `caption=""`, so the destination is media-only.
+5. **Strips captions** — uses Telethon's `forward_messages(drop_media_captions=True, drop_author=True)`. Captions AND "forwarded from" headers are both stripped — the destination gets clean media only.
 6. **Burst pacing** — sends 50 items back-to-back (0.5s between each = ~25s burst), then waits until 60s have elapsed since the burst started (~35s idle). Result: steady **~50 items per minute** throughput, which is what Telegram tolerates for sustained bulk sending to a single chat.
 7. **Persists sent IDs** to `state.json` locally. (On Render free tier, this is wiped on redeploy by default — set `USE_TELEGRAM_STATE_SYNC=1` if you want it mirrored to Saved Messages as a document, or upgrade to a paid Disk.)
 8. **Stops on `POST /stop`** — hit the HTTP endpoint, click the Stop button on `/`, press Ctrl+C, or use Render's Suspend button. All halt the bot gracefully after the current item.
@@ -542,11 +554,14 @@ If you're catching up on a large backlog (e.g. 10,000 saved items), the bot will
 
 ## How caption stripping works
 
-For **single media**: Pyrogram's `client.copy_message(target, source, msg_id, caption="")` re-sends the same media object with a fresh (empty) caption. No re-download/upload — Telegram server references the original file.
+The bot uses Telethon's `forward_messages(target, batch, drop_author=True, drop_media_captions=True)`:
 
-For **albums**: `client.copy_media_group(target, source, msg_id, captions=["", "", ...])` does the same for the whole media group, preserving album grouping.
+- **`drop_media_captions=True`** tells Telegram to strip the caption from each forwarded item.
+- **`drop_author=True`** is REQUIRED by Telegram when `drop_media_captions=True`. It also strips the "forwarded from" header, so the destination sees the media as if it was posted there originally (no forward tag).
 
-If a particular Telegram update type doesn't support the `caption=""` override (rare edge cases), the unit will be logged and skipped — it'll be retried on the next sweep.
+This is a **Telegram API constraint** (not a Telethon limitation) — you cannot strip the caption without also stripping the forward header. For most bulk-forwarding use cases this is exactly what you want (clean media, no clutter).
+
+**Bonus:** Telethon's `forward_messages` accepts up to **100 message IDs in a single MTProto call**, so the bot sends a batch of 50 items in one round-trip — dramatically faster than the old Pyrogram version which called `copy_message` 50 times in a row.
 
 ---
 

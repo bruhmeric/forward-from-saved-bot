@@ -1,5 +1,5 @@
 """
-One-time local script to generate a Pyrogram StringSession.
+One-time local script to generate a Telethon StringSession.
 
 Usage (local, NOT on Render):
     python session_setup.py
@@ -22,14 +22,14 @@ import sys
 
 async def main() -> None:
     try:
-        from pyrogram import Client
-        from pyrogram.errors import SessionRevoked, AuthKeyUnregistered
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
     except ImportError:
-        print("Missing pyrogram. Run: pip install -r requirements.txt")
+        print("Missing telethon. Run: pip install -r requirements.txt")
         sys.exit(1)
 
     print("=" * 70)
-    print("Telegram Saved-Messages bulk forwarder — session setup")
+    print("Telegram Saved-Messages bulk forwarder — session setup (Telethon)")
     print("=" * 70)
     print("Get API_ID and API_HASH from: https://my.telegram.org/apps\n")
 
@@ -47,45 +47,32 @@ async def main() -> None:
         print(f"API_ID must be numeric, got {api_id_str!r}")
         sys.exit(1)
 
-    app = Client(
-        name="session_setup",
-        api_id=api_id,
-        api_hash=api_hash,
-        phone_number=phone,
-        in_memory=True,                  # don't write a .session file
+    # Use a StringSession so we can export the session as a string later.
+    client = TelegramClient(
+        StringSession(),
+        api_id,
+        api_hash,
     )
 
     print("\nConnecting — Telegram may send you a login code. Reply with it when prompted.")
     try:
-        await app.start()
-    except (SessionRevoked, AuthKeyUnregistered) as e:
-        print(f"\nAuth failed: {e!r}. Generate a fresh API session.")
-        sys.exit(1)
+        await client.start(phone=phone)
     except Exception as e:
         print(f"\nLogin failed: {e!r}")
         sys.exit(1)
 
     try:
-        me = await app.get_me()
-        print(f"\nLogged in as: {me.first_name} (@{me.username or '—'}) id={me.id}")
+        me = await client.get_me()
+        first_name = getattr(me, "first_name", None) or "?"
+        username = getattr(me, "username", None)
+        uid = getattr(me, "id", "?")
+        print(f"\nLogged in as: {first_name} (@{username or '—'}) id={uid}")
 
-        # Pyrogram 2.0.106: export_session_string() returns a COROUTINE — must await.
-        # Pyrogram 1.x and some 2.x point releases: returns a str directly.
-        # Handle both cases by detecting the return type at runtime.
-        raw = app.export_session_string()
-        if hasattr(raw, "__await__"):
-            # It's a coroutine — await it.
-            session_str = await raw
-        else:
-            # It's a plain string.
-            session_str = raw
+        # Telethon: session.save() returns the string directly (sync).
+        session_str = client.session.save()
 
-        # Verify the session string is well-formed (Pyrogram v2 expects ~370 chars).
-        if not isinstance(session_str, str) or not session_str:
-            print(f"\n⚠️  WARNING: export_session_string() returned {type(session_str).__name__} "
-                  f"instead of str. Login may not have completed properly.")
-            sys.exit(1)
-        if len(session_str) < 200:
+        # Sanity check.
+        if not session_str or len(session_str) < 200:
             print(f"\n⚠️  WARNING: session string looks too short ({len(session_str)} chars). "
                   "Login may not have completed properly.")
             sys.exit(1)
@@ -115,9 +102,9 @@ async def main() -> None:
         print("  ✗ wrap it in quotes")
         print("  ✗ add spaces at the start/end")
         print()
-        print(f"Length: {len(session_str)} chars · Format: Pyrogram v2 StringSession")
+        print(f"Length: {len(session_str)} chars · Format: Telethon StringSession v1")
     finally:
-        await app.stop()
+        await client.disconnect()
 
 
 if __name__ == "__main__":
