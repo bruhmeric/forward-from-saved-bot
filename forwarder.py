@@ -368,12 +368,6 @@ async def run_forwarder(
     stop_reason_holder: dict = {"reason": ""}
     print(f"[forwarder] starting — target={cfg.target} filter={sorted(cfg.filter_types)} order={cfg.order}")
 
-    # Wire /status callback so the watcher can produce a snapshot on demand.
-    def _status_cb() -> str:
-        snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))
-        return tp.status_snapshot_text(snap)
-    stop_watcher.status_callback = _status_cb
-
     # Wire web server status_provider so /status returns live JSON.
     def _web_status_provider() -> dict:
         snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))

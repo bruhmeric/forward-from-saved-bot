@@ -135,6 +135,9 @@ class TelegramProgress:
 
     async def start(self, initial: Snapshot) -> None:
         """Either reuse an existing progress message or post a new one."""
+        if not self._enabled:
+            # Disabled — skip silently. Web UI is the only progress surface.
+            return
         # Try to reuse a previously-persisted message_id.
         existing = self._load_message_id()
         if existing:

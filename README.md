@@ -1,479 +1,502 @@
-# Telegram Forwarder Bot
+# Telegram Saved Messages Bulk Forwarder
 
-A self-hosted Telegram bot that forwards whatever you send it to a chosen topic (forum thread) or regular chat. Supports pulling content from locked / private channels via your personal Telegram account session (Telethon), **auto-scraping entire channels**, and sending directly to Saved Messages for the fastest path.
+A Python **web service** that pulls media out of your **Saved Messages** and forwards it in 50-item batches to a designated channel/group — with no captions, conservative rate limiting, and a **web dashboard** at `/` for live progress + a `POST /stop` endpoint for halting it remotely.
 
-## Features
+Built to run on **Render's free tier** (web service + StringSession auth). Also works locally.
 
-| Feature | How |
-|---|---|
-| **Direct forward** of text / photo / video / file / album | Send to bot → tap a topic button (or single Forward button for non-forum) |
-| **Time-based batch** for multiple messages | Send many photos rapidly → bot waits 5s, shows ONE picker for everything |
-| **Pull from locked private channels** | Send a `t.me/c/<id>/<msg_id>` link — bot uses Telethon to fetch and re-upload |
-| **Pull from public channels** | Send a `t.me/<channelname>/<msg_id>` link |
-| **Auto-scrape entire channels** | `/scrape <url> [flags]` — bot iterates ALL messages and sends media in parallel |
-| **Media type filters** | `/scrape <url> photo video` — only photos and videos; `/scrape <url> docs audio` — only docs and audio |
-| **Direct to Saved Messages** | `/saved <url>` — skip the picker, fastest path |
-| **Live progress display** | Bot edits the status message during download/upload with % complete and MB transferred |
-| **Streamable video uploads** | Videos re-uploaded with `supports_streaming=True`, original thumbnail, duration, dimensions |
-| **Three-tier protected-content fallback** | true forward → send_message(file=) → download + send_file (works on noforwards channels) |
-| **Auto-discover forum topics** | `/refresh` enumerates via Telethon `GetForumTopics` |
-| **Manual topic override** | `/addtopic <title> <id>` |
-| **Non-forum destinations** | Bot auto-detects via `get_chat().is_forum` and shows single Forward button instead of topic picker |
-| **Persistent state** | SQLite (`forwarder.db`) |
-| **Admin whitelist** | Optional `ADMIN_IDS` in `.env` |
-| **Concurrent update processing** | Multiple links / messages handled in parallel (no queue-blocked updates) |
-| **Webhook + polling modes** | Webhook for Render/fps.ms, polling for local dev |
-| **StringSession** | No `.session` file needed on ephemeral filesystems (Render) |
-| **Deploy to Render free tier** | `render.yaml` Blueprint included |
-
-The bot re-uploads media from locked channels (it does NOT use Telegram's native forward feature) — this works even when the source channel has "forwarding / saving restricted" enabled, because your **personal account** can still view the content and the bot re-uploads the bytes through your user session's download.
+> **Note on Render free tier:** background workers are paid-only, so this bot runs as a web service that binds to `$PORT` and serves a tiny HTTP status page. The bot still runs continuously; the HTTP server is just there to satisfy Render's platform health check AND to give you a clean web UI for monitoring + control. By default, NO messages are posted to your Saved Messages — the web UI is the only progress surface.
 
 ---
 
-## Quick start (three paths)
+## What it does
 
-| If you want to... | Follow... |
-|---|---|
-| Run it on your own machine or VPS | [Local setup](#local-setup) |
-| Deploy to Render.com free tier | [Render setup](#render-setup) |
-| Just see all the commands | [Commands](#commands) |
-
----
-
-## Local setup
-
-### 1. Prerequisites
-
-- Python 3.10 or newer
-- A Telegram bot token — create a bot via [@BotFather](https://t.me/BotFather), copy the token
-- Telegram API credentials — get `API_ID` and `API_HASH` from <https://my.telegram.org/apps> (sign in -> "API development tools")
-- A destination chat (group or channel, forum or non-forum). The bot must be a member with "Send Messages" permission. Your personal Telegram account must also be a member (for Telethon-based features).
-
-### 2. Install
-
-```bash
-cd telegram-forwarder-bot
-
-python -m venv .venv
-source .venv/bin/activate    # on Windows: .venv\Scripts\activate
-
-pip install -r requirements.txt
-
-cp .env.example .env
-```
-
-Edit `.env`:
-
-| Variable | Value |
-|---|---|
-| `BOT_TOKEN` | From @BotFather |
-| `API_ID` | From my.telegram.org |
-| `API_HASH` | From my.telegram.org |
-| `PHONE` | Your phone (used only by `login.py`) |
-| `DESTINATION_GROUP_ID` | e.g. `-1001234567890` (optional for `/saved` and `/scrape saved`) |
-| `ADMIN_IDS` | Comma-separated Telegram user IDs (optional but recommended) |
-
-### 3. One-time Telethon login
-
-```bash
-python login.py            # file-based session (local dev)
-# OR
-python login.py --string   # StringSession (recommended for Render)
-```
-
-You'll be prompted for:
-- A confirmation code sent to your Telegram
-- (Optional) 2FA password if your account has it
-
-### 4. Add the bot to the destination group
-
-1. Add the bot to your destination group as a **member** (not admin — member is enough)
-2. Make sure "Send Messages" is allowed for the bot
-3. If the group is a forum, the bot will be able to post into specific topics
-
-### 5. Run
-
-```bash
-python bot.py
-```
-
-### 6. First-time configuration
-
-In a private chat with the bot:
-
-```
-/setgroup -1001234567890      # set destination (optional for /saved, /scrape saved)
-/info                         # see chat info — is it a forum? title?
-/refresh                      # discover topics (forum only)
-/topics                       # confirm topics were discovered
-```
-
-If `/refresh` fails (e.g. because your account isn't a member of the group), you can add topics manually:
-
-```
-/addtopic Videos 12
-/addtopic Images 34
-```
-
-### 7. Using the bot
-
-**Direct forward** — send anything to the bot. The bot waits 5 seconds (in case you send more items), then shows a single picker with everything. Tap a topic (or the "Forward to <chat>" button for non-forum destinations).
-
-**Locked-channel forward** — paste a link to a single message:
-```
-https://t.me/c/1234567890/42
-https://t.me/privatechannelname/42
-```
-The bot fetches via your Telethon session, then shows the picker.
-
-**Direct to Saved Messages** (fast path):
-```
-/saved https://t.me/c/1234567890/42
-```
-Skips the picker entirely — content goes straight to Saved Messages.
-
-**Auto-scrape entire channel**:
-```
-/scrape https://t.me/somechannel
-/scrape https://t.me/c/1234567890 saved old
-/scrape https://t.me/c/1234567890 photo video parallel=5
-```
-Iterates ALL messages in the channel and sends media in parallel. See [Scraping](#scraping) below.
+1. Connects to Telegram using **your personal user account** (via Pyrogram `StringSession`) — required because Saved Messages is a user-only feature, not accessible to bot tokens.
+2. Iterates Saved Messages (oldest-first by default, configurable to newest-first).
+3. Skips anything that isn't a photo / video / animation (GIF) per your `--filter` choice.
+4. **Keeps albums together** — multi-photo posts are re-sent as a single `send_media_group` call.
+5. **Strips captions** — every item is forwarded with `caption=""`, so the destination is media-only.
+6. **Conservative rate limiting** — ~2.5s between messages, then a 2-3 minute pause after every 50.
+7. **Persists sent IDs** to `state.json` locally. (On Render free tier, this is wiped on redeploy by default — set `USE_TELEGRAM_STATE_SYNC=1` if you want it mirrored to Saved Messages as a document, or upgrade to a paid Disk.)
+8. **Stops on `POST /stop`** — hit the HTTP endpoint, click the Stop button on `/`, press Ctrl+C, or use Render's Suspend button. All halt the bot gracefully after the current item.
+9. After a full sweep, sleeps 5 min and re-scans — so newly saved items get picked up without a restart.
+10. **Live upload progress in web UI** — every item shows: sweep number, item number, message id, kind (photo/video/animation/album), per-upload byte progress (when a real upload is needed), cumulative totals, and items/min rate. The `/` page auto-refreshes every 10 seconds.
+11. **JSON status API** at `GET /status` for external monitoring (UptimeRobot, custom dashboards, etc.).
+12. **(Optional) Telegram-side live progress** — set `TELEGRAM_PROGRESS=1` to ALSO mirror progress to your Saved Messages. Default OFF.
 
 ---
 
-## Commands
-
-| Command | Action |
-|---|---|
-| `/start` | Show the intro message |
-| `/help` | Show the help message |
-| `/setgroup <id>` | Set the destination group/channel (forum or non-forum) |
-| `/info` | Show destination chat info (is it a forum? title? member count?) |
-| `/refresh` | Re-fetch forum topics via Telethon (forum only) |
-| `/topics` | List known topics (forum only) |
-| `/addtopic <title> <id>` | Add a topic manually (forum only) |
-| `/deltopic <id>` | Remove a manually-added topic |
-| `/status` | Show bot status (Telethon, group, topics, admins) |
-| `/whoami` | Show your Telegram user ID + admin status |
-| `/test_link <url>` | Diagnostic: test fetching a t.me link (shows step-by-step report) |
-| `/saved <url>` | 🚀 FAST: send t.me link content directly to Saved Messages |
-| `/scrape <url> [flags]` | 🤖 AUTO: scrape ALL media from a channel |
-| `/stop_scrape` | 🛑 stop the active scrape |
-| `/scrape_status` | 📊 check scrape progress |
-| `/caption <text>` | 📝 set a custom caption (replaces original on all forwards) |
-| `/caption strip` | 📝 strip ALL captions from forwarded media |
-| `/caption clear` | 📝 restore original caption behavior |
-| `/cancel` | Cancel any pending forward for this chat |
-
----
-
-## Captions
-
-By default, the bot preserves original captions when forwarding. You can change this:
-
-### `/caption <text>` — set a custom caption
+## Project layout
 
 ```
-/caption Check out this content!
-```
-
-All forwarded media (via `/scrape`, `/saved`, or sending a link) will use this caption instead of the original. Truncated to Telegram's 1024-char limit.
-
-### `/caption strip` — strip all captions
-
-```
-/caption strip
-```
-
-Forwards media WITHOUT any caption. Useful when you don't want the source's captions polluting your destination.
-
-### `/caption clear` — restore original captions
-
-```
-/caption clear
-```
-
-Returns to the default behavior: forwards use the original caption from the source.
-
-### `/caption` (no args) — show current setting
-
-```
-/caption
-```
-
-Shows the current caption mode and a preview of the text if set.
-
-### How it works
-
-When a custom caption is set:
-- **`/scrape`** — every forwarded media item gets your custom caption (no original captions)
-- **`/saved <url>`** — the saved message gets your custom caption
-- **Direct link forward** — the picked topic/chat receives media with your custom caption
-- **Direct message forward** (send photos to bot → tap topic) — same: custom caption applied
-
-The caption is applied to the **first item** of an album only (Telegram albums only show one caption). For single media, the custom caption is used directly.
-
-When set to "strip" (empty string), no captions are sent at all. Text-only messages from the source are skipped entirely.
-
-When set to "clear" (None), original captions are preserved (legacy behavior).
-
----
-
-## Scraping
-
-`/scrape <url> [flags]` is the most powerful command — it iterates all messages in a channel and forwards each media message to your destination.
-
-### Syntax
-
-```
-/scrape <channel_url> [flags]
-```
-
-### Flags (any combination)
-
-| Flag | Effect |
-|---|---|
-| `old` | Oldest first (chronological order). Default: newest first. |
-| `saved` | Send to Saved Messages. Default: destination group. |
-| `photo` / `photos` | Only photos |
-| `video` / `videos` | Only videos |
-| `doc` / `docs` | Only documents |
-| `audio` | Only audio |
-| `voice` | Only voice messages |
-| `animation` | Only animations (GIFs) |
-| `parallel=N` | Set parallel send count (default 3, max 10) |
-
-If no media type filter is specified, ALL media is forwarded.
-
-### Examples
-
-```
-/scrape https://t.me/publicchannel
-/scrape https://t.me/c/1234567890
-/scrape https://t.me/c/1234567890 saved old
-/scrape https://t.me/c/1234567890 photo video         # only photos + videos
-/scrape https://t.me/c/1234567890 saved old videos parallel=5  # all options
-```
-
-### How it works
-
-1. **Parses** the channel URL (`t.me/c/<id>` or `t.me/<username>`)
-2. **Resolves the channel** via Telethon (confirms your user account is a member)
-3. **Iterates all messages** with `client.iter_messages` (memory-efficient — doesn't load everything at once)
-4. **For each message with media**:
-   - Classifies the media type (photo, video, animation, document, audio, voice)
-   - Applies your filter (if any)
-   - Sends via the **same three-tier fallback** as `/saved`:
-     1. Try `forward_messages` (fastest, works for non-protected)
-     2. Fall back to `send_message(file=msg.media)` (works for some protected)
-     3. Final fallback: download + re-upload with `send_file` (works for fully-protected, preserves thumbnail, streaming, duration, dimensions)
-   - **Skips text-only messages** and non-downloadable types (web pages, contacts, geos, polls)
-5. **Rate limiting**: 0.3 sec delay per parallel slot + automatic FloodWait handling
-6. **Status updates**: edits the status message every 5 sec with progress (sent/failed/skipped counts)
-7. **Cancellation**: check between each message; `/stop_scrape` stops cleanly (waits for in-flight sends)
-
-### Example session
-
-```
-You: /scrape https://t.me/somechannel saved old videos parallel=5
-
-Bot: 🔍 Starting scrape...
-     Source: somechannel
-     Destination: Saved Messages
-     Order: oldest first
-     Filter: only: video
-     Parallel: 5 sends
-
-     Use /stop_scrape to cancel, /scrape_status to check progress.
-
-[5 sec later]
-Bot: [edits same message]
-     📊 Scraping in progress...
-     Total seen: 47
-     Sent: 23
-     Failed: 0
-     Skipped (filtered/no media): 24
-     Last msg ID: 1042
-     Parallel sends: 5
-
-You: /stop_scrape
-Bot: 🛑 Stop signal sent...
-
-Bot: [final status]
-     🛑 Scraping cancelled by user.
-        Sent: 156, Failed: 2, Skipped: 89
-```
-
-### Speed tuning
-
-- **Default: `parallel=3`** — safe, ~9 msgs/sec total (3 slots × 3 msgs/sec each)
-- **`parallel=5`** — ~15 msgs/sec, may hit FloodWait occasionally
-- **`parallel=10`** (max) — ~30 msgs/sec, will likely hit FloodWait often; bot handles it automatically by sleeping and retrying
-
-If you hit FloodWait frequently, lower the parallel count.
-
-### Notes
-
-- Your user account must be a member of the source channel
-- Your user account must be a member of the destination chat (or use `saved` for Saved Messages)
-- The scrape runs in the background — you can use other bot commands meanwhile
-- Only one scrape at a time — the second `/scrape` will be rejected
-- If Render sleeps the service mid-scrape, the task is lost (not persisted). Re-run `/scrape` to continue.
-- For huge channels (10000+ posts), expect it to take hours at the safe rate
-
----
-
-## /saved — fast path to Saved Messages
-
-`/saved <url>` skips the topic picker entirely and sends content directly to your Saved Messages via Telethon. This is the fastest path because:
-- No topic picker (instant, no waiting for user input)
-- No topic thread (simpler API call)
-- Your account is always a member of Saved Messages
-
-```
-/saved https://t.me/c/1234567890/42
-```
-
-Live progress is shown during download/upload (with % complete and MB transferred). Then `✅ Sent to Saved Messages!`
-
-The same three-tier fallback applies: true forward → send_message(file=) → download + send_file.
-
----
-
-## How protected content (noforwards) works
-
-When a channel has "Save / Forward" disabled by the admin:
-
-1. **Try `forward_messages`** — Telegram blocks this with `ChatForwardsRestrictedError`
-2. **Try `send_message(file=msg.media)`** — also blocked (Telethon detects the reference to a protected message)
-3. **Download to disk + `send_file(file=path)`** — this works:
-   - Downloads the bytes (your account has view access as a member)
-   - Re-uploads as a brand new file with no link to the protected source
-   - Preserves: original attributes (DocumentAttributeVideo with duration, w, h), `supports_streaming=True`, mime_type, original filename
-   - Downloads the **thumbnail** separately and attaches it as the video poster
-   - Uses **512KB chunk size** for download and upload (4x faster than Telethon's auto-picker)
-
----
-
-## Render setup
-
-See [Render setup (in original README)](#render-setup-details) below for the full step-by-step.
-
-### Quick start
-
-1. Push the project to GitHub (unzip `telegram-forwarder-bot.zip`, `git init`, push)
-2. Generate SESSION_STRING locally:
-   ```bash
-   pip install -r requirements.txt
-   cp .env.example .env  # fill in API_ID, API_HASH, PHONE
-   python login.py --string
-   # Copy the printed SESSION_STRING
-   ```
-3. Render Dashboard → New → Blueprint → select your repo → Apply
-4. First deploy will fail (no WEBHOOK_URL yet). Note your service URL: `https://telegram-forwarder-bot-xyz.onrender.com`
-5. Set env vars in Render (Environment tab):
-   - `MODE=webhook`
-   - `BOT_TOKEN`, `API_ID`, `API_HASH`, `SESSION_STRING`, `DESTINATION_GROUP_ID`, `ADMIN_IDS`
-   - `WEBHOOK_URL=https://telegram-forwarder-bot-xyz.onrender.com`
-   - `DB_PATH=/tmp/forwarder.db`
-6. Save → Render redeploys. Logs should show `Bot started: @your_bot mode=webhook`
-7. Send `/start`, `/whoami`, `/status` to verify
-8. (Optional) Set up UptimeRobot to keep Render awake (free tier sleeps after 15 min)
-
-<a id="render-setup-details"></a>
-
-### Render Blueprint (`render.yaml`)
-
-The repo includes `render.yaml` for one-click deploy:
-
-```yaml
-services:
-  - type: web
-    name: telegram-forwarder-bot
-    runtime: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    autoDeploy: true
-    envVars:
-      - key: MODE
-        value: webhook
-      # ... (BOT_TOKEN, API_ID, etc. set in dashboard)
-```
-
----
-
-## File layout
-
-```
-telegram-forwarder-bot/
-├── bot.py                # main entry (webhook + polling modes, concurrent updates)
-├── login.py              # one-time Telethon login (--string for Render)
-├── config.py             # env loader
-├── db.py                 # SQLite layer
-├── user_session.py       # Telethon manager + link parser + scrape_channel
-├── topics.py             # forum topic discovery + inline keyboard
-├── handlers/
-│   ├── __init__.py
-│   ├── admin.py          # /setgroup, /scrape, /saved, /info, /test_link, etc.
-│   ├── direct.py         # direct forward + time-based batch window
-│   └── link.py           # locked-channel URL → fetch + forward
-├── render.yaml           # Render Blueprint
-├── .python-version       # pins Python 3.12.0
+tg-bulk-forwarder/
+├── main.py                  # CLI entrypoint + orchestration
+├── config.py                # Env vars + CLI flag merging
+├── forwarder.py             # Core loop: sweep → filter → send → mark_sent
+├── filters.py               # Photo / Video / Animation matcher
+├── progress.py              # Console live progress bars (sweep, item, upload, batch pause)
+├── telegram_progress.py     # Telegram-side live progress message (in-place edits)
+├── telegram_state_sync.py   # Mirror state.json to Saved Messages (free-tier persistence hack)
+├── web_server.py            # Tiny asyncio HTTP server on $PORT (/, /health, /status, /stop)
+├── rate_limiter.py          # Pacing + FloodWait auto-retry
+├── stop_signal.py           # Background thread polling Saved Messages for /stop & /status
+├── state.py                 # state.json persistence (atomic writes)
+├── session_setup.py         # One-time local script → prints SESSION_STRING
+├── render.yaml              # Render WEB SERVICE config (free tier)
+├── Dockerfile               # Docker image (alternative to native Python runtime)
 ├── requirements.txt
-├── run.sh                # convenience launcher
 ├── .env.example
-├── .gitignore
 └── README.md
 ```
 
 ---
 
+## 1) Get your Telegram API credentials
+
+You need an **API ID** and **API HASH** from Telegram (not a bot token).
+
+1. Visit https://my.telegram.org → **API Development Tools**.
+2. Fill the form (any app name, any short name, platform can be "Desktop").
+3. Note down `api_id` (numeric) and `api_hash` (long alphanumeric string).
+
+> ⚠️ These credentials are tied to **your personal Telegram account**. Don't commit them to git.
+
+---
+
+## 2) Generate the StringSession (run locally once)
+
+This step **must run on a machine where you can receive the Telegram login code** — Render's headless environment won't work because it can't prompt you for the SMS/app code.
+
+```bash
+cd tg-bulk-forwarder
+pip install -r requirements.txt
+python session_setup.py
+```
+
+You'll be prompted for:
+- `API_ID` (paste from step 1)
+- `API_HASH` (paste from step 1)
+- `Phone` (with country code, e.g. `+447700900000`)
+- The Telegram login code (sent to your Telegram app — sometimes SMS)
+- Your 2FA password if you have one enabled
+
+The script will print something like:
+
+```
+======================================================================
+✅ SESSION_STRING generated successfully!
+======================================================================
+
+COPY ONLY THE LINE BELOW (no quotes, no 'SESSION_STRING=' prefix):
+
+AQB1dHg6...long_string_here...XYZ
+
+======================================================================
+
+HOW TO USE IT:
+
+  • In Render → Environment → add a new var:
+      Key:   SESSION_STRING
+      Value: <paste the line above, exactly as-is>
+
+  • In local .env:
+      SESSION_STRING=<paste the line above>
+
+DO NOT:
+  ✗ include 'SESSION_STRING=' in the Value field (Render adds that)
+  ✗ wrap it in quotes
+  ✗ add spaces at the start/end
+
+Length: 370 chars · Format: Pyrogram v2 StringSession
+```
+
+### Critical: how to paste into Render's env var
+
+When you create the env var on Render, you have two fields:
+- **Key**: `SESSION_STRING`
+- **Value**: paste the LONG STRING ONLY — **NOT** `SESSION_STRING=ABC123`, just `ABC123`
+
+If you accidentally paste `SESSION_STRING=ABC123` into the Value field, the bot will fail with `struct.error: unpack requires a buffer of 271 bytes`. The bot has built-in auto-cleaning that strips this prefix, but if you still see that error, double-check the raw Value field on Render.
+
+If you're still hitting that error after re-pasting, see the "Troubleshooting" section below.
+
+---
+
+## 3) Run locally (optional — for testing before deploying)
+
+```bash
+cp .env.example .env
+# Edit .env: fill in API_ID, API_HASH, SESSION_STRING, TARGET
+```
+
+Then:
+
+```bash
+# Default: photo+video+animation, oldest first, conservative pacing
+python main.py
+
+# Override on the CLI
+python main.py --target=@my_channel --filter=photo --order=old
+python main.py --target=-1001234567890 --filter=video,animation
+```
+
+To stop locally: either press `Ctrl+C`, or send `/stop` to your Saved Messages from any Telegram client.
+
+---
+
+## 4) Deploy to Render (free tier — WEB SERVICE)
+
+> Render's free tier does **not** support background workers. This project runs as a **web service** instead — it binds to `$PORT` and serves a tiny HTTP server (just `/health`, `/status`, `/`, `/stop`) alongside the forwarding loop. The bot itself still runs continuously; the HTTP server is just there to satisfy Render's platform health check.
+
+### Option A: Connect a GitHub repo (recommended)
+
+1. Push this folder to a GitHub repo.
+2. In Render Dashboard → **New** → **Web Service**.
+3. Connect your GitHub repo.
+4. Render should auto-detect `render.yaml`. If not, set:
+   - **Runtime**: Python 3
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `python main.py`
+   - **Plan**: Free
+5. Under **Environment**, set these required vars:
+   - `API_ID` = (from step 1)
+   - `API_HASH` = (from step 1)
+   - `SESSION_STRING` = (from step 2)
+   - `TARGET` = `@your_channel` or `-1001234567890`
+6. (Optional) Set the other env vars from `.env.example` to override defaults.
+7. Click **Create Web Service**.
+
+Render auto-sets `PORT` (usually 10000). The bot binds to `0.0.0.0:$PORT` within ~5 seconds of boot and serves `/health` → `OK` for the platform health check.
+
+### Option B: Docker image
+
+Use the included `Dockerfile`:
+- Render → New → **Web Service** → **Docker** runtime → point at the repo.
+- Same env vars as Option A.
+
+### Why no persistent disk?
+
+Render's free tier doesn't include persistent disks — `state.json` would be wiped on every deploy or sleep cycle. **The bot works around this by mirroring state.json as a document to your Saved Messages** (every 60s by default). On startup, the bot scans the latest `[BULK-FORWARDER-STATE]` document and restores its resume memory.
+
+If you later upgrade to a paid Render plan with a Disk:
+1. Mount a 1GB disk at `/data`.
+2. Set `STATE_FILE=/data/state.json` and `PROGRESS_MESSAGE_ID_FILE=/data/progress_msg_id.txt`.
+3. Set `USE_TELEGRAM_STATE_SYNC=0` (no longer needed).
+
+---
+
+## 5) Render free-tier limitations & workarounds
+
+### The 15-minute sleep problem
+
+Render free web services **sleep after 15 minutes of no inbound HTTP traffic**. While sleeping, the bot is fully paused — no media gets forwarded.
+
+**Fix:** set up an external uptime monitor that pings your service every ~10 minutes:
+
+- [UptimeRobot](https://uptimerobot.com/) (free, 50 monitors)
+- [cron-job.org](https://cron-job.org/) (free)
+- [Better Stack](https://betterstack.com/) (free tier)
+
+Point it at `https://your-service.onrender.com/health` with HTTP 200 expected. The bot will be kept awake indefinitely.
+
+### The 750 instance-hours/month limit
+
+Render free tier includes 750 instance-hours/month (~31 days of always-on). With the uptime monitor workaround above, you'll likely hit this limit before the month ends. The bot will pause until the next billing cycle starts, then resume automatically.
+
+**Practical guidance:**
+- 750 hours ≈ enough to forward ~3,000-5,000 photos per month at conservative pacing.
+- If you need more, upgrade to Render's Starter plan ($7/month, always-on).
+
+### State persistence across redeploys
+
+The bot mirrors `state.json` to your Saved Messages as a JSON document every 60s. On startup, the latest mirror is restored. This means:
+
+- ✅ A redeploy keeps your resume memory.
+- ✅ A crash keeps your resume memory.
+- ✅ A Render sleep/wake cycle keeps your resume memory.
+- ⚠️ If you manually delete the state document from Saved Messages, the bot will start fresh next time.
+- ⚠️ If you change `TARGET`, the bot will ignore the old state doc (target mismatch).
+
+### Cold start delays
+
+When Render wakes the service, it takes ~30-60s to boot Python, install deps (if cached), connect to Telegram, and start forwarding. The HTTP `/health` endpoint is up within ~5s, so Render won't kill the service, but you'll see a brief delay before media starts flowing.
+
+---
+
+## Stopping the bot
+
+Three ways to halt (web UI is the primary control surface):
+
+1. **HTTP**: `curl -X POST https://your-service.onrender.com/stop` — or click the **Stop bot** button on the `/` status page.
+2. **Ctrl+C** when running locally.
+3. **Render's Suspend button** sends `SIGTERM`, which the bot handles the same way.
+
+In all cases, the bot finishes the current item, saves state (and mirrors it to Saved Messages if `USE_TELEGRAM_STATE_SYNC=1`), then exits cleanly.
+
+> **Optional:** if you set `TELEGRAM_PROGRESS=1`, you can ALSO send `/stop`, `/halt`, or `/kill` to your Saved Messages from any Telegram client. By default this is OFF — the web UI is the only control surface.
+
+---
+
+## Configuration reference
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_ID` | — | Telegram API ID (required) |
+| `API_HASH` | — | Telegram API hash (required) |
+| `SESSION_STRING` | — | Pyrogram StringSession from `session_setup.py` (required) |
+| `TARGET` | — | Destination `@username` or `-100…` id (required) |
+| `FILTER` | `photo,video,animation` | Comma-separated subset of {photo, video, animation} |
+| `ORDER` | `old` | `new` (newest first) or `old` (oldest first — DEFAULT) |
+| `BATCH_SIZE` | `50` | Items per batch before long pause (1-50) |
+| `PER_MESSAGE_DELAY` | `2.5` | Seconds between individual sends |
+| `BATCH_PAUSE_MIN` | `120` | Min seconds pause after each batch |
+| `BATCH_PAUSE_MAX` | `180` | Max seconds pause after each batch |
+| `STOP_POLL_INTERVAL` | `5` | Seconds between Saved Messages polls for `/stop` |
+| `STATE_FILE` | `./state.json` | Path to local sent-IDs state file (ephemeral on free tier) |
+| `PORT` | (Render auto-sets) | HTTP server port — Render injects this automatically |
+| `TELEGRAM_PROGRESS` | `0` | `1`/`on` to ALSO post live progress to PROGRESS_CHAT (default OFF — web UI is primary) |
+| `PROGRESS_CHAT` | `me` | Where live progress + `/stop` + `/status` commands are watched (only used if `TELEGRAM_PROGRESS=1`) |
+| `PROGRESS_UPDATE_INTERVAL` | `5.0` | Min seconds between Telegram edits (≥2) |
+| `PROGRESS_MESSAGE_ID_FILE` | (next to STATE_FILE) | Persists live message_id so restart edits the same message |
+| `USE_TELEGRAM_STATE_SYNC` | `0` | Mirror state.json to PROGRESS_CHAT (default OFF — your "already sent" list resets on Render redeploy unless you upgrade to a paid Disk) |
+| `STATE_SYNC_INTERVAL_SEC` | `60` | How often to push state.json to Telegram (≥30s) |
+
+### CLI overrides
+
+Every env var has a matching CLI flag — use `python main.py --help` to see them all. CLI flags override env vars.
+
+```
+--target, --filter, --order, --batch-size, --per-message-delay,
+--batch-pause-min, --batch-pause-max, --api-id, --api-hash,
+--session-string, --state-file, --rescan-interval
+```
+
+---
+
+## Live progress output
+
+Every line in the log is rendered in place (using ANSI carriage return) so you get a continuously-updating single line per active operation. Example of what you'll see:
+
+```
+=== Sweep #1 started ===
+→ sweep#1 item#0 msg_id=4839 [photo] — cumulative 0 items / 0 msgs (0.0/min)
+✓ sweep#1 item#1 msg_id=4839 [photo] — cumulative 1 items / 1 msgs (12.4/min) (4.8s)
+
+→ sweep#1 item#2 msg_id=4840 [album(3×video)] — cumulative 1 items / 1 msgs (12.4/min)
+✓ sweep#1 item#3 msg_id=4840 [album(3×video)] — cumulative 2 items / 4 msgs (15.8/min) (11.2s)
+
+→ sweep#1 item#4 msg_id=4841 [photo] — cumulative 2 items / 4 msgs (15.8/min)
+↑ sweep#1 item#4 msg_id=4841 [photo] upload [██████░░░░░░]  50.0% — cumulative 2 items / 4 msgs (15.8/min)
+↑ sweep#1 item#4 msg_id=4841 [photo] upload [████████████] 100.0% — cumulative 2 items / 4 msgs (15.8/min)
+✓ sweep#1 item#5 msg_id=4841 [photo] upload [████████████] 100.0% — cumulative 3 items / 5 msgs (16.1/min) (7.4s)
+
+  ↪ skip msg_id=4842: none of 1 items match filter
+
+  ⏸  Batch #1 complete — pausing…
+  ⏸  Batch pause [██░░░░░░░░░░] 96s remaining
+  ⏸  Batch pause [██████░░░░░░] 48s remaining
+  ⏸  Batch pause [████████████] 0s remaining
+  ▶  Resuming after batch pause.
+
+=== Sweep #1 done: 50 items / 73 msgs in 642.3s (4.7 items/min, 12 skipped) ===
+
+--- Cumulative ---
+  sweeps:        1
+  items sent:    50
+  messages sent: 73
+  skipped:       12
+  runtime:       642s (4.7 items/min avg)
+```
+
+**Legend:**
+
+| Glyph | Meaning |
+|---|---|
+| `→` | item send just started |
+| `↑` | real upload in progress (bytes flowing from your machine to Telegram — happens only when `copy_message` fails and we fall back to `send_photo` / `send_video` / `send_animation`) |
+| `✓` | item send complete (with elapsed time) |
+| `↪` | item skipped (filter miss, already sent, etc.) |
+| `⏸` | batch pause countdown |
+| `▶` | resuming after batch pause |
+
+**Why most items don't show upload progress:**
+
+When the bot uses `copy_message` / `copy_media_group`, Telegram performs a **server-side copy** — your client only sends a small reference, no file transfer happens. That's fast and bandwidth-efficient. Upload progress bars only appear in the **fallback path** when the copy fails (e.g., the source message was deleted, the media type doesn't support copy, or Telegram returned an obscure error) and the bot re-sends the file by downloading it to memory and uploading it fresh.
+
+To **force** the upload path (so you always see progress bars), edit `forwarder.py` and replace `_dispatch_single` / `_dispatch_album` with the `_upload_*` variants directly. Not recommended — it's much slower and uses your bandwidth.
+
+**Reading the live bar in Render logs:**
+
+Render's log viewer renders ANSI cursor codes correctly. If you tail logs via `render logs --tail`, you'll see the bar updating in place. If you're using a non-ANSI terminal (rare), set `NO_COLOR=1` to get plain line-by-line output instead.
+
+---
+
+## Telegram-side live progress message (optional, OFF by default)
+
+> **Default behavior**: the web UI at `/` is the only progress surface. The bot does NOT post anything to your Saved Messages. This section describes the OPTIONAL Telegram-side mirror you can enable with `TELEGRAM_PROGRESS=1`.
+
+If you want a Telegram-side mirror of progress IN ADDITION to the web UI, set `TELEGRAM_PROGRESS=1`. The bot will post ONE message to your Saved Messages (or any chat you configure) and edit it in place every ~5 seconds with the current sweep #, items sent, current item, upload %, batch-pause countdown, and cumulative totals. You'll also be able to send `/stop` and `/status` to that chat as Telegram messages.
+
+### What it shows
+
+```
+▶️ Bulk Forwarder — Live Progress
+Status: RUNNING
+━━━━━━━━━━━━━━━━━━━━━━━━
+📍 Target: @my_channel
+📍 Filter: photo,video  ·  Order: new
+
+🔄 Sweep #3 · 4m12s elapsed
+   📦 23 items · 41 msgs · 5 skipped
+   ⚡ 5.4 items/min
+
+📊 Cumulative
+   📦 127 items · 234 msgs · 12 skipped
+   ⏱ 31m runtime · 4.1 items/min avg
+
+🔄 Current item
+   msg_id=4839 · [photo]
+   ⏱ 4.2s elapsed
+   ↑ Upload [████████░░] 67.5% (4.8/7.1 MB)
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕒 Last update: 14:23:11
+💬 Send /stop to halt · /status for snapshot
+```
+
+During a batch pause, the message shows a live countdown:
+
+```
+⏸ Bulk Forwarder — Live Progress
+Status: PAUSED
+…
+
+⏸ Batch #1 pause
+   [██████░░░░] 48s remaining (of 120s)
+```
+
+When the bot stops (via `/stop`, Ctrl+C, or Render SIGTERM), the final edit shows:
+
+```
+🛑 Bulk Forwarder — Live Progress
+Status: STOPPED · Stopped by user / shutdown
+…
+```
+
+### Commands
+
+| Command | Action |
+|---|---|
+| `/stop` (or `/halt`, `/kill`) | Halt the bot gracefully after the current item |
+| `/status` | Reply with a fresh one-shot snapshot (compact text) |
+
+Send these as a normal message to the control chat (`PROGRESS_CHAT`, defaults to your Saved Messages). The watcher polls every `STOP_POLL_INTERVAL` seconds (default 5).
+
+### Configuration
+
+| Env var | Default | Description |
+|---|---|---|
+| `TELEGRAM_PROGRESS` | `1` | `1`/`on` to enable, `0`/`off` to disable. When off, only console logs are produced. |
+| `PROGRESS_CHAT` | `me` | Chat where the live message lives + where `/stop` & `/status` are watched. `me` = Saved Messages. |
+| `PROGRESS_UPDATE_INTERVAL` | `5.0` | Min seconds between Telegram edits. Must be ≥ 2 to avoid FloodWait. |
+| `PROGRESS_MESSAGE_ID_FILE` | (next to `STATE_FILE`) | Persists the live message's id so a restart edits the same message instead of posting a new one. |
+
+CLI equivalents: `--telegram-progress on|off`, `--progress-chat=@mycontrol`, `--progress-update-interval=10`.
+
+### Restart behavior
+
+The bot persists the live message's id to `progress_msg_id.txt` (next to `state.json` — so on Render, mount the same disk and both files survive redeploys). On restart:
+
+1. The bot tries to edit the existing message.
+2. If the message was deleted or is in a different chat, it posts a fresh one and updates the file.
+
+This means a Render redeploy won't spam your Saved Messages with duplicate progress messages.
+
+### Disabling
+
+If you don't want Telegram-side progress at all (e.g., you find it noisy), set `TELEGRAM_PROGRESS=0` or pass `--telegram-progress off`. You'll still see console progress bars in Render logs.
+
+---
+
+## HTTP status page & API
+
+When deployed, the bot serves a tiny HTTP server on Render's `$PORT`. Routes:
+
+| Method | Path | Returns | Use case |
+|---|---|---|---|
+| `GET` | `/` | HTML status dashboard (auto-refreshes every 10s) | Human-friendly view; click "Stop bot" button |
+| `GET` | `/health` | `OK` | Render platform health check (must respond within 60s of boot) |
+| `GET` | `/status` | JSON snapshot of current progress | Programmatic monitoring, external dashboards |
+| `POST` | `/stop` | `stop signal received…` | Halt the bot via curl/script |
+| `GET` | `/favicon.ico` | 204 No Content | Browser favicon suppression |
+
+Example:
+
+```bash
+# Check bot status from CLI
+curl https://your-service.onrender.com/status | jq .
+
+# Halt the bot from CLI
+curl -X POST https://your-service.onrender.com/stop
+```
+
+The `/` HTML page auto-refreshes every 10 seconds — leave it open in a browser tab for a live dashboard.
+
+---
+
+## How caption stripping works
+
+For **single media**: Pyrogram's `client.copy_message(target, source, msg_id, caption="")` re-sends the same media object with a fresh (empty) caption. No re-download/upload — Telegram server references the original file.
+
+For **albums**: `client.copy_media_group(target, source, msg_id, captions=["", "", ...])` does the same for the whole media group, preserving album grouping.
+
+If a particular Telegram update type doesn't support the `caption=""` override (rare edge cases), the unit will be logged and skipped — it'll be retried on the next sweep.
+
+---
+
+## Safety & limits
+
+- **Conservative pacing**: ~2.5s/message + 2-3 min pause after every 50 ⇒ ~250 messages/hour. Telegram's user-account limit is ~30 msg/sec burst / ~200 msg/min sustained, so we're nowhere near it.
+- **FloodWait auto-retry**: if Telegram says "wait N seconds", we sleep N+2s and retry up to 3 times.
+- **Atomic state writes**: `state.json` is written via temp-file + rename, so a crash mid-write never corrupts it.
+- **Per-item error isolation**: a failure on one item doesn't kill the run — it's logged and skipped, retried next sweep.
+- **No re-sending on restart**: state.json tracks all sent Saved Messages IDs. Resume is idempotent.
+
+---
+
 ## Troubleshooting
 
-### `/start` doesn't respond
+### `struct.error: unpack requires a buffer of 271 bytes`
 
-- Check Render logs for `📨 Incoming update_id=...` — if absent, Telegram isn't reaching your webhook
-- Check `https://api.telegram.org/bot<TOKEN>/getWebhookInfo` — `url` should match your Render URL
-- If `pending_update_count > 0` and `last_error_message="Read timeout expired"` — Render is asleep. Set up UptimeRobot (5-min pings) or move to fps.ms (never sleeps).
-- If `ADMIN_IDS` is set but doesn't include your user ID, all commands silently fail. Send `/whoami` (always responds) to see your ID.
+This is the #1 most common Render deployment error. It means the `SESSION_STRING` env var value is malformed. Causes & fixes:
 
-### Locked-channel link fails
+| Cause | Fix |
+|---|---|
+| **Value includes `SESSION_STRING=` prefix** | Render's env var has two fields: **Key** and **Value**. Put `SESSION_STRING` in Key, and ONLY the long string (no `SESSION_STRING=` prefix) in Value. |
+| **Value is wrapped in quotes** | Render env vars don't need quotes. Remove any `"` or `'` you may have added. |
+| **Value is truncated** | Pyrogram v2 sessions are ~370 chars. If yours is shorter, your terminal may have truncated it during copy-paste. Re-run `session_setup.py` and copy more carefully — try `pbcopy`/`xclip` if available. |
+| **Value has whitespace/newlines** | Some terminals add a trailing newline. The bot auto-strips these, but check the raw Value field on Render. |
+| **Generated with wrong Pyrogram version** | If you ran `session_setup.py` with a different Pyrogram version than `requirements.txt` specifies (pyrogram 2.0.106), the session format won't match. Re-run it inside a fresh `pip install -r requirements.txt` env. |
+| **Session was revoked** | If you logged out from Telegram's "Active Sessions" page or revoked it some other way, regenerate it. |
 
-- Send `/test_link <url>` — the bot shows a step-by-step diagnostic of where it failed
-- Most common: your user account is not a member of the source channel → `ChannelPrivateError`
-- If you see `ChatForwardsRestrictedError` → the bot should fall through to the third-tier fallback (download + re-upload). If it doesn't, send the diagnostic to me.
+The bot now prints a friendly diagnostic on Render when this happens, including the session length and a 30-char preview so you can compare it with what `session_setup.py` printed locally.
 
-### Scraping is slow
+### Other common issues
 
-- Default `parallel=3` is conservative. Try `parallel=5` or `parallel=10` to go faster.
-- If you hit FloodWait often (you'll see `⏳ Flood wait` in the status), lower the parallel count.
-- For huge channels, scraping will take hours at any safe rate. Run it overnight.
-
-### Videos sent as documents (no streaming, no thumbnail)
-
-- The bot preserves `DocumentAttributeVideo`, mime_type, and `supports_streaming=True`
-- If the source video has a thumbnail, the bot downloads and attaches it
-- If you see `(no thumbnail)` in the diagnostic, the source had no embedded thumb — Telegram will generate one from the video itself
-
----
-
-## Security checklist
-
-- [ ] Keep `SESSION_STRING` private — grants full access to your Telegram account
-- [ ] Set `ADMIN_IDS` so only you can use the bot
-- [ ] Don't commit `.env` or `*.session` to git (`.gitignore` covers them)
-- [ ] Use a strong, unique password on the Telegram account whose session you're using
+| Symptom | Likely cause / fix |
+|---|---|
+| `SESSION_STRING` rejected on Render | Run `session_setup.py` again locally — sessions can expire. |
+| `FloodWait` constantly | Lower `BATCH_SIZE` or raise `PER_MESSAGE_DELAY`. Telegram may also be throttling your account globally. |
+| `PeerIdInvalid` for target | Make sure you've opened the target channel once from your account, or use the `-100…` numeric id. |
+| Bot is running but nothing forwards | Check the `FILTER` — items in Saved Messages that are stickers, voice notes, or documents don't match any filter. |
+| State resets on Render redeploy | Should not happen — the bot mirrors state to Saved Messages every 60s. If it does, check `USE_TELEGRAM_STATE_SYNC=1` is set and `PROGRESS_CHAT=me`. |
+| Stop command not detected | The watcher only reacts to `/stop` sent **after** the bot started. Older historical `/stop` messages in Saved Messages are ignored. |
+| Album comes through split into single photos | Telegram's album grouping can be lost if any item in the album was forwarded/deleted before fetch. The bot will retry the next sweep. |
+| Service keeps sleeping on free tier | Render free web services sleep after 15 min of no inbound HTTP. Set up UptimeRobot to ping `https://your-service.onrender.com/health` every 10 min. |
 
 ---
 
-## Roadmap (not implemented)
+## License
 
-- Persistent scrape state (survive Render restarts)
-- Topic-aware scraping (send to a specific topic, not just chat-level)
-- Caption editing / stripping
-- Retry queue for failed sends
-- Auto-resume on bot restart
-
-These can be added on request.
+MIT — do whatever you want. No warranty. Be a good Telegram citizen and don't abuse rate limits.

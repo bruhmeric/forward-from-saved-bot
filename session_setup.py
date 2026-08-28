@@ -69,12 +69,23 @@ async def main() -> None:
         me = await app.get_me()
         print(f"\nLogged in as: {me.first_name} (@{me.username or '—'}) id={me.id}")
 
-        # Pyrogram 2.x: export_session_string() is SYNC, returns str directly.
-        # Do NOT await it — awaiting a str raises TypeError.
-        session_str = app.export_session_string()
+        # Pyrogram 2.0.106: export_session_string() returns a COROUTINE — must await.
+        # Pyrogram 1.x and some 2.x point releases: returns a str directly.
+        # Handle both cases by detecting the return type at runtime.
+        raw = app.export_session_string()
+        if hasattr(raw, "__await__"):
+            # It's a coroutine — await it.
+            session_str = await raw
+        else:
+            # It's a plain string.
+            session_str = raw
 
         # Verify the session string is well-formed (Pyrogram v2 expects ~370 chars).
-        if not session_str or len(session_str) < 200:
+        if not isinstance(session_str, str) or not session_str:
+            print(f"\n⚠️  WARNING: export_session_string() returned {type(session_str).__name__} "
+                  f"instead of str. Login may not have completed properly.")
+            sys.exit(1)
+        if len(session_str) < 200:
             print(f"\n⚠️  WARNING: session string looks too short ({len(session_str)} chars). "
                   "Login may not have completed properly.")
             sys.exit(1)

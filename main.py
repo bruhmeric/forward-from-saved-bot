@@ -179,13 +179,20 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         batch_pause_max=cfg.batch_pause_max,
     )
 
-    # Stop watcher (background thread with own event loop). Uses the same
-    # control chat as TelegramProgress so /stop and /status land in one place.
+    # Stop watcher — runs as an asyncio task on Pyrogram's event loop.
+    # Only polls the control chat for /stop & /status if TELEGRAM_PROGRESS=1
+    # (or USE_TELEGRAM_STATE_SYNC=1, which also implies Saved Messages is in use).
+    # When both are OFF, the watcher just owns the asyncio.Event and the web UI
+    # POST /stop is the only control surface.
     stop_watcher = StopWatcher(
         client=client,
         poll_interval=cfg.stop_poll_interval,
         control_chat=cfg.progress_chat,
+        poll_control_chat=cfg.telegram_progress or cfg.use_telegram_state_sync,
     )
+    # Hold a reference to the running event loop so the SIGTERM/SIGINT handler
+    # (which runs in a different thread) can flip the stop_event safely.
+    main_loop = asyncio.get_running_loop()
 
     # Telegram live-progress reporter.
     tp = TelegramProgress(
@@ -214,10 +221,11 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         on_stop=stop_watcher.request_stop,
     )
 
-    # Ctrl+C handler — also flips the stop event.
+    # Ctrl+C / SIGTERM handler — runs in a separate thread (signal handlers
+    # always do), so we MUST use call_soon_threadsafe to mutate asyncio state.
     def _sigint(*_):
-        print("\n[main] Ctrl+C received — requesting graceful stop after current item…")
-        stop_watcher.request_stop()
+        print("\n[main] Ctrl+C/SIGTERM received — requesting graceful stop after current item…")
+        main_loop.call_soon_threadsafe(stop_watcher.request_stop)
     signal.signal(signal.SIGINT, _sigint)
     signal.signal(signal.SIGTERM, _sigint)  # Render sends SIGTERM on shutdown
 
@@ -283,14 +291,19 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         print(f"[main] WARNING: web server failed to start: {e!r}")
         print("[main] (Render will probably kill the service — ensure $PORT is set and not already in use)")
 
-    # Start the /stop watcher.
-    stop_watcher.start_background()
+    # Start the /stop watcher on Pyrogram's event loop.
+    stop_watcher.start()
 
     try:
         await run_forwarder(client, cfg, state, stop_watcher, limiter, tp, web,
                             state_sync=state_sync,
                             rescan_interval_sec=rescan_interval)
     finally:
+        # Cancel the /stop watcher task so it doesn't leak.
+        try:
+            await stop_watcher.stop()
+        except Exception as e:
+            print(f"[main] stop_watcher shutdown failed: {e!r}")
         try:
             state.save()
         except Exception as e:

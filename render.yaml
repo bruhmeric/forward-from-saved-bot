@@ -1,62 +1,70 @@
-# Render Blueprint — deploys the Telegram Forwarder Bot to Render's free tier.
+# Render WEB SERVICE — required for free tier (background workers are paid-only).
 #
-# How to use:
-#   1. Push this repo to GitHub
-#   2. Go to https://dashboard.render.com -> New -> Blueprint
-#   3. Select your repo. Render reads render.yaml and creates the service.
-#   4. After the first deploy, copy the service URL (e.g. https://your-name.onrender.com)
-#      and set the WEBHOOK_URL env var to it. Then redeploy.
+# Render auto-sets $PORT (usually 10000). The bot binds to 0.0.0.0:$PORT
+# and serves a tiny HTTP server with routes:
+#   GET  /           human-readable status page (HTML, auto-refresh)
+#   GET  /health     "OK" — Render's health check pings this
+#   GET  /status     JSON snapshot of current bot progress
+#   POST /stop       trigger graceful stop
 #
-# Alternatively, deploy manually via:
-#   https://dashboard.render.com -> New + -> Web Service -> connect repo
+# ⚠️  IMPORTANT: if you previously deployed an older version of this bot,
+#     DELETE these stale env vars from Render → Environment:
+#       - TELEGRAM_PROGRESS
+#       - PROGRESS_CHAT
+#       - PROGRESS_UPDATE_INTERVAL
+#       - PROGRESS_MESSAGE_ID_FILE
+#       - USE_TELEGRAM_STATE_SYNC
+#       - STATE_SYNC_INTERVAL_SEC
+#       - STOP_POLL_INTERVAL
+#     They are no longer used. Leaving them set to "1" will have NO effect
+#     (the code ignores them now), but it's cleaner to remove them.
 #
-# Free-tier caveats:
-#   * The service sleeps after 15 min of inactivity
-#   * First request after sleep takes ~30-60 sec to wake up (Render cold start)
-#   * 512 MB RAM, 0.1 CPU — plenty for this bot
-#   * Ephemeral disk — that's why we use StringSession, not a session file
+# Render free tier notes:
+#   - Sleeps after 15 min of no inbound HTTP traffic → bot halts.
+#     Send a /status request every ~10 min from an external uptime monitor
+#     (cron-job.org, uptime-robot, etc.) to keep it awake.
+#   - No persistent disk → state.json is wiped on every redeploy.
+#     Resume memory does NOT survive redeploys on the free tier.
+#   - 750 instance-hours/month = ~31 days of always-on, but sleeps reset the
+#     counter — practical limit is much higher.
+#
+# Required env vars (set in Render Dashboard → Environment):
+#   API_ID          — from my.telegram.org
+#   API_HASH        — from my.telegram.org
+#   SESSION_STRING  — from running `python session_setup.py` locally
+#   TARGET          — @channel or -1001234567890
 
 services:
   - type: web
-    name: telegram-forwarder-bot
+    name: tg-bulk-forwarder
     runtime: python
-    plan: free
-    # Choose the region closest to your users (oregon / ohio / frankfurt / singapore)
-    region: oregon
+    plan: free                 # free tier — web service, sleeps after 15 min idle
+    region: singapore           # change to your nearest region
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    # Auto-deploy when you push to your default branch
+    startCommand: python main.py
+    healthCheckPath: /health   # Render pings this; must return 200 within 60s of boot
     autoDeploy: true
-    # Health check path — Render will ping this to verify the service is alive
-    # Note: python-telegram-bot's webhook server returns 404 for unknown paths,
-    # which is fine — Render considers any HTTP response as "alive"
-    healthCheckPath: /
     envVars:
-      # ===== Mode (REQUIRED) — must be webhook for Render =====
-      - key: MODE
-        value: webhook
-      # ===== Secrets — set these in Render dashboard after first deploy =====
-      # sync: false means Render won't try to generate a value, you must enter it
-      - key: BOT_TOKEN
-        sync: false
       - key: API_ID
-        sync: false
+        sync: false             # set in dashboard
       - key: API_HASH
-        sync: false
+        sync: false             # set in dashboard
       - key: SESSION_STRING
-        sync: false
-      - key: DESTINATION_GROUP_ID
-        sync: false
-      - key: ADMIN_IDS
-        sync: false
-      # ===== Webhook URL =====
-      # Set this to https://<service-name>.onrender.com AFTER the first deploy
-      # (you won't know the URL until Render creates the service)
-      - key: WEBHOOK_URL
-        sync: false
-      # ===== DB on ephemeral disk — lose on restart, that's fine =====
-      - key: DB_PATH
-        value: /tmp/forwarder.db
-      # ===== Python version (must match .python-version file) =====
-      - key: PYTHON_VERSION
-        value: "3.12.0"
+        sync: false             # set in dashboard
+      - key: TARGET
+        sync: false             # set in dashboard
+      - key: FILTER
+        value: photo,video,animation
+      - key: ORDER
+        value: old
+      - key: BATCH_SIZE
+        value: "50"
+      - key: PER_MESSAGE_DELAY
+        value: "2.5"
+      - key: BATCH_PAUSE_MIN
+        value: "120"
+      - key: BATCH_PAUSE_MAX
+        value: "180"
+      - key: PYTHONUNBUFFERED
+        value: "1"               # ensures logs stream in real-time on Render
+      # Render auto-sets PORT — do not override it here.

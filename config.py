@@ -1,104 +1,185 @@
-"""Configuration loader — reads .env and exposes typed settings.
-
-Supports two run modes:
-  * MODE=polling  (default, for local dev) — bot uses long-polling
-  * MODE=webhook  (recommended for Render) — bot serves a webhook on $PORT
-
-For Render:
-  * Render injects PORT automatically — the bot listens on 0.0.0.0:$PORT
-  * The Telethon session must be a StringSession stored in SESSION_STRING,
-    because Render's free tier filesystem is ephemeral (the .session file
-    would be lost on every restart)
+"""
+Config loading: env vars (Render-friendly) with CLI flag overrides.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterable, Set
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    # dotenv is optional; environment may already be set
-    pass
+from dotenv import load_dotenv
 
-
-def _int_list(value: str) -> list[int]:
-    return [int(x.strip()) for x in value.split(",") if x.strip()]
+# Only load .env if present (local dev). On Render, env vars are injected.
+load_dotenv()
 
 
 @dataclass
 class Config:
-    bot_token: str
-    api_id: Optional[int]
-    api_hash: Optional[str]
-    phone: Optional[str]
-    destination_group_id: Optional[int]
-    admin_ids: list[int] = field(default_factory=list)
-    session_name: str = "user_session"
-    db_path: str = "forwarder.db"
-    # --- deployment mode ---
-    mode: str = "polling"  # "polling" | "webhook"
-    webhook_url: Optional[str] = None
-    port: int = 8080
-    session_string: Optional[str] = None
+    # Telegram credentials
+    api_id: int
+    api_hash: str
+    session_string: str
 
-    @classmethod
-    def load(cls) -> "Config":
-        token = os.environ.get("BOT_TOKEN", "").strip()
-        if not token:
-            raise RuntimeError("BOT_TOKEN missing — copy .env.example to .env and fill it in.")
+    # Destination
+    target: str
 
-        api_id_raw = os.environ.get("API_ID", "").strip()
-        api_hash = os.environ.get("API_HASH", "").strip()
-        phone = os.environ.get("PHONE", "").strip() or None
+    # Filtering
+    filter_types: Set[str]            # subset of {"photo","video","animation"}
 
-        dest_raw = os.environ.get("DESTINATION_GROUP_ID", "").strip()
-        dest = int(dest_raw) if dest_raw else None
+    # Behaviour
+    order: str                        # "new" or "old"
+    batch_size: int
+    per_message_delay: float          # seconds between individual messages
+    batch_pause_min: int              # seconds pause after each batch of N
+    batch_pause_max: int
+    stop_poll_interval: int           # seconds between Saved Messages polls
 
-        admin_raw = os.environ.get("ADMIN_IDS", "").strip()
-        admins = _int_list(admin_raw) if admin_raw else []
+    # State
+    state_file: str
 
-        mode_raw = os.environ.get("MODE", "polling").strip().lower()
-        mode = mode_raw if mode_raw in ("polling", "webhook") else "polling"
+    # Telegram-side live progress reporter (defaults OFF — web UI is the primary interface)
+    telegram_progress: bool = False       # post live progress to a chat
+    progress_chat: str = "me"             # 'me' = Saved Messages, or @username / -100…
+    progress_update_interval: float = 5.0 # throttle (seconds between edits)
+    progress_message_id_file: str = ""    # where to persist the live message_id
 
-        webhook_url = os.environ.get("WEBHOOK_URL", "").strip() or None
+    # Web server (Render free-tier requires binding to a port)
+    web_port: int = 10000               # Render sets $PORT; this is the fallback
+    web_host: str = "0.0.0.0"
 
-        port_raw = os.environ.get("PORT", "").strip()
-        port = int(port_raw) if port_raw else 8080
+    # Telegram-synced state (defaults OFF — only needed if you want resume memory across redeploys without a paid disk)
+    use_telegram_state_sync: bool = False
+    state_sync_interval_sec: int = 60   # how often to push state to Telegram
 
-        session_string = os.environ.get("SESSION_STRING", "").strip() or None
+    def __post_init__(self) -> None:
+        if self.order not in ("new", "old"):
+            raise ValueError(f"ORDER must be 'new' or 'old', got {self.order!r}")
+        valid = {"photo", "video", "animation"}
+        bad = self.filter_types - valid
+        if bad:
+            raise ValueError(f"Unknown filter types {bad}. Valid: {valid}")
+        if not self.filter_types:
+            raise ValueError("FILTER is empty — choose at least one of photo,video,animation")
+        if self.batch_size < 1 or self.batch_size > 50:
+            raise ValueError("BATCH_SIZE must be between 1 and 50")
+        if self.batch_pause_min > self.batch_pause_max:
+            raise ValueError("BATCH_PAUSE_MIN must be <= BATCH_PAUSE_MAX")
+        if self.progress_update_interval < 2.0:
+            # Telegram rate-limits message edits; keep >=2s to avoid FloodWait.
+            raise ValueError("PROGRESS_UPDATE_INTERVAL must be >= 2.0 seconds")
+        if not self.progress_chat:
+            raise ValueError("PROGRESS_CHAT must be set (use 'me' for Saved Messages)")
+        if self.web_port < 1 or self.web_port > 65535:
+            raise ValueError("PORT must be between 1 and 65535")
+        if self.state_sync_interval_sec < 30:
+            # Telegram rate-limits sending documents; keep >= 30s to be safe.
+            raise ValueError("STATE_SYNC_INTERVAL_SEC must be >= 30 seconds")
 
-        return cls(
-            bot_token=token,
-            api_id=int(api_id_raw) if api_id_raw else None,
-            api_hash=api_hash or None,
-            phone=phone,
-            destination_group_id=dest,
-            admin_ids=admins,
-            session_name=os.environ.get("SESSION_NAME", "user_session") or "user_session",
-            db_path=os.environ.get("DB_PATH", "forwarder.db") or "forwarder.db",
-            mode=mode,
-            webhook_url=webhook_url,
-            port=port,
-            session_string=session_string,
+
+def _parse_filter(raw: str) -> Set[str]:
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return set(parts) if parts else {"photo", "video", "animation"}
+
+
+def _clean_session_string(raw: str) -> str:
+    """
+    Defensively clean a SESSION_STRING value.
+
+    Common user mistakes this fixes:
+    - Pasting 'SESSION_STRING=ABC123' (with the prefix) into the Value field
+    - Wrapping in quotes ('\"ABC123\"' or \"'ABC123'\")
+    - Trailing/leading whitespace / newlines
+    - HTML-escaped characters (&amp; &lt; etc.) from copy-paste
+
+    Does NOT validate that the string is a valid Pyrogram session —
+    just removes obvious copy-paste mistakes so Pyrogram has a chance.
+    """
+    s = raw.strip()
+    # Strip an accidental 'SESSION_STRING=' or 'SESSION_STRING:' prefix.
+    for prefix in ("SESSION_STRING=", "SESSION_STRING:",
+                   "session_string=", "session_string:"):
+        if s.startswith(prefix):
+            s = s[len(prefix):].lstrip()
+            break
+    # Strip surrounding quotes if present (single or double, matched pair).
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1]
+    # Strip any trailing newline/whitespace that snuck in.
+    s = s.strip()
+    # Common HTML-escape artifacts from copy-pasting through a web UI:
+    s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return s
+
+
+def from_env(cli_overrides: dict | None = None) -> Config:
+    """Build Config from env vars, with optional CLI flag overrides."""
+    cli = cli_overrides or {}
+
+    api_id_raw = cli.get("api_id") or os.environ.get("API_ID")
+    api_hash   = cli.get("api_hash") or os.environ.get("API_HASH") or ""
+    sess       = _clean_session_string(cli.get("session_string") or os.environ.get("SESSION_STRING") or "")
+    target     = cli.get("target") or os.environ.get("TARGET") or ""
+    filter_raw = cli.get("filter") or os.environ.get("FILTER") or "photo,video,animation"
+    order      = (cli.get("order") or os.environ.get("ORDER") or "old").lower()
+    batch_size = int(cli.get("batch_size") or os.environ.get("BATCH_SIZE") or "50")
+    per_msg    = float(cli.get("per_message_delay") or os.environ.get("PER_MESSAGE_DELAY") or "2.5")
+    bp_min     = int(cli.get("batch_pause_min") or os.environ.get("BATCH_PAUSE_MIN") or "120")
+    bp_max     = int(cli.get("batch_pause_max") or os.environ.get("BATCH_PAUSE_MAX") or "180")
+    stop_int   = int(cli.get("stop_poll_interval") or os.environ.get("STOP_POLL_INTERVAL") or "5")
+    state_file = cli.get("state_file") or os.environ.get("STATE_FILE") or "./state.json"
+
+    # Telegram-side live progress (defaults OFF — web UI is the primary interface)
+    tp_raw     = (cli.get("telegram_progress") or os.environ.get("TELEGRAM_PROGRESS") or "0").strip().lower()
+    telegram_progress = tp_raw in ("1", "true", "yes", "on")
+    progress_chat     = cli.get("progress_chat") or os.environ.get("PROGRESS_CHAT") or "me"
+    progress_interval = float(cli.get("progress_update_interval") or os.environ.get("PROGRESS_UPDATE_INTERVAL") or "5.0")
+    progress_msg_file = cli.get("progress_message_id_file") or os.environ.get("PROGRESS_MESSAGE_ID_FILE") or ""
+    if not progress_msg_file:
+        # Put it next to state.json so a Render Disk mount at /data picks it up too.
+        base = os.path.dirname(os.path.abspath(state_file)) or "."
+        progress_msg_file = os.path.join(base, "progress_msg_id.txt")
+
+    # Web server (Render free tier)
+    port_raw  = cli.get("web_port") or os.environ.get("PORT") or os.environ.get("WEB_PORT") or "10000"
+    web_port  = int(port_raw)
+    web_host  = cli.get("web_host") or os.environ.get("WEB_HOST") or "0.0.0.0"
+
+    # Telegram-synced state (defaults OFF — only needed if you want resume memory across redeploys without a paid disk)
+    tsync_raw = (cli.get("use_telegram_state_sync") or os.environ.get("USE_TELEGRAM_STATE_SYNC") or "0").strip().lower()
+    use_telegram_state_sync = tsync_raw in ("1", "true", "yes", "on")
+    state_sync_interval_sec = int(cli.get("state_sync_interval_sec") or os.environ.get("STATE_SYNC_INTERVAL_SEC") or "60")
+
+    if not api_id_raw:
+        raise SystemExit("Missing API_ID. Set it in env or pass --api-id.")
+    if not api_hash:
+        raise SystemExit("Missing API_HASH. Set it in env or pass --api-hash.")
+    if not sess:
+        raise SystemExit(
+            "Missing SESSION_STRING. Run `python session_setup.py` locally first, "
+            "then paste the printed string into your env vars."
         )
+    if not target:
+        raise SystemExit("Missing TARGET. Pass --target=@channel or set TARGET env var.")
 
-    @property
-    def has_user_session(self) -> bool:
-        # Session works if we have api_id+api_hash AND at least one of
-        # (file-based session name, session_string).
-        return bool(self.api_id and self.api_hash)
-
-    def is_admin(self, user_id: int) -> bool:
-        if not self.admin_ids:
-            # No whitelist configured -> allow anyone (single-user self-hosted bot)
-            return True
-        return user_id in self.admin_ids
-
-    @property
-    def webhook_url_path(self) -> str:
-        """Path component of the webhook URL — uses the secret part of the
-        bot token so the webhook endpoint is not easily guessable."""
-        return self.bot_token.split(":")[-1]
+    return Config(
+        api_id=int(api_id_raw),
+        api_hash=api_hash,
+        session_string=sess,
+        target=target,
+        filter_types=_parse_filter(filter_raw),
+        order=order,
+        batch_size=batch_size,
+        per_message_delay=per_msg,
+        batch_pause_min=bp_min,
+        batch_pause_max=bp_max,
+        stop_poll_interval=stop_int,
+        state_file=state_file,
+        telegram_progress=telegram_progress,
+        progress_chat=progress_chat,
+        progress_update_interval=progress_interval,
+        progress_message_id_file=progress_msg_file,
+        web_port=web_port,
+        web_host=web_host,
+        use_telegram_state_sync=use_telegram_state_sync,
+        state_sync_interval_sec=state_sync_interval_sec,
+    )
