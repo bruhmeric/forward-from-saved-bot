@@ -159,7 +159,7 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     print(f"  target         : {cfg.target}")
     print(f"  filter         : {sorted(cfg.filter_types)}")
     print(f"  order          : {cfg.order}")
-    print(f"  batch_size     : {cfg.batch_size}")
+    print(f"  batch_size     : {cfg.batch_size} msgs/burst (Telegram's sustained limit is ~30/min)")
     print(f"  per_message    : {cfg.per_message_delay}s (within-burst delay)")
     items_per_min = (cfg.batch_size * 60) / cfg.batch_interval_sec
     print(f"  batch_interval : {cfg.batch_interval_sec}s (between burst starts → ~{items_per_min:.0f} items/min)")

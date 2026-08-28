@@ -185,132 +185,408 @@ class WebServer:
         except Exception as e:
             snap = {"error": str(e)}
 
-        # Build a small human-readable HTML status page.
+        # Build a modern dashboard with live AJAX updates.
         uptime = int(time.time() - self._started_at)
         h, rem = divmod(uptime, 3600)
         m, s = divmod(rem, 60)
         uptime_str = f"{h}h{m}m{s}s"
 
-        snap_json = html.escape(json.dumps(snap, default=str, indent=2))
+        snap_json_escaped = html.escape(json.dumps(snap, default=str, indent=2))
+        # Initial values for SSR; JS will update them live via /status polling.
         target = html.escape(str(snap.get("target", "—")))
         filter_str = html.escape(str(snap.get("filter_types", "—")))
         order = html.escape(str(snap.get("order", "—")))
         stopped = snap.get("stopped", False)
-        status_text = "STOPPED" if stopped else "RUNNING"
-        status_color = "#c62828" if stopped else "#2e7d32"
-        sweep_num = snap.get("sweep_num", 0)
-        items_in_sweep = snap.get("items_in_sweep", 0)
-        msgs_in_sweep = snap.get("msgs_in_sweep", 0)
-        skipped_in_sweep = snap.get("skipped_in_sweep", 0)
-        total_items = snap.get("total_items_sent", 0)
-        total_msgs = snap.get("total_msgs_sent", 0)
-        total_skipped = snap.get("total_skipped", 0)
-        current_id = snap.get("current_item_id")
-        current_kind = snap.get("current_item_kind", "")
-        upload_active = bool(snap.get("upload_active"))
-        upload_total = int(snap.get("upload_total", 0))
-        upload_current = int(snap.get("upload_current", 0))
-        batch_pause = bool(snap.get("batch_pause_active"))
-        batch_remaining = float(snap.get("batch_pause_remaining", 0))
-        last_offset_id = int(snap.get("last_offset_id", 0))
+        # state_sent_count is also used to compute "remaining" in JS.
         state_sent_count = int(snap.get("state_sent_ids_count", 0))
+        last_offset_id = int(snap.get("last_offset_id", 0))
 
-        upload_html = ""
-        if upload_active and upload_total:
-            pct = upload_current / upload_total * 100
-            upload_html = f"<p>↑ Upload: {pct:.1f}% ({upload_current/(1024*1024):.1f}/{upload_total/(1024*1024):.1f} MB)</p>"
-
-        batch_html = ""
-        if batch_pause:
-            batch_html = f"<p>⏸ Batch pause: {batch_remaining:.0f}s remaining</p>"
-
-        current_html = ""
-        if current_id:
-            current_html = f"<p>Current item: <code>msg_id={current_id}</code> [{html.escape(current_kind)}]</p>"
+        # Initial render of dynamic fields — JS will overwrite these on first poll.
+        status_text = "STOPPED" if stopped else "RUNNING"
+        status_dot_class = "stopped" if stopped else "running"
 
         return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Telegram Bulk Forwarder — Status</title>
+  <title>Telegram Bulk Forwarder — Dashboard</title>
   <style>
-    body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #fafafa; color: #222; max-width: 800px; margin: 2em auto; padding: 0 1em; }}
-    h1 {{ margin: 0 0 .5em 0; }}
-    .badge {{ display: inline-block; padding: .15em .6em; border-radius: 12px;
-              color: white; background: {status_color}; font-weight: 600; font-size: 12px; }}
-    .row {{ display: flex; gap: 2em; flex-wrap: wrap; }}
-    .card {{ background: white; padding: 1em 1.5em; border-radius: 8px;
-              box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 1em; }}
-    code {{ background: #f0f0f0; padding: .1em .3em; border-radius: 3px; }}
-    pre {{ background: #1e1e1e; color: #d4d4d4; padding: 1em; border-radius: 6px;
-            overflow: auto; font-size: 12px; }}
-    a {{ color: #1976d2; }}
-    .meta {{ color: #888; font-size: 12px; }}
-    button {{ background: #c62828; color: white; border: none; padding: .5em 1em;
-              border-radius: 6px; cursor: pointer; font-weight: 600; }}
-    button:hover {{ background: #b71c1c; }}
+    :root {{
+      --bg: #0f1419;
+      --panel: #1a1f2e;
+      --panel-2: #232938;
+      --border: #2d3548;
+      --text: #e4e6eb;
+      --text-dim: #8b92a5;
+      --accent: #5b9bf5;
+      --green: #4ade80;
+      --red: #f87171;
+      --yellow: #fbbf24;
+      --blue: #60a5fa;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg); color: var(--text); min-height: 100vh; padding: 1em;
+    }}
+    .container {{ max-width: 1100px; margin: 0 auto; }}
+
+    /* Header */
+    .header {{
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 1em 1.5em; background: var(--panel);
+      border: 1px solid var(--border); border-radius: 12px; margin-bottom: 1em;
+    }}
+    .header-left {{ display: flex; align-items: center; gap: 0.75em; }}
+    .header h1 {{ font-size: 1.25em; font-weight: 600; }}
+    .header-sub {{ color: var(--text-dim); font-size: 0.8em; margin-top: 0.2em; }}
+    .status-pill {{
+      display: inline-flex; align-items: center; gap: 0.5em;
+      padding: 0.4em 0.9em; border-radius: 20px;
+      background: rgba(74, 222, 128, 0.12); color: var(--green);
+      font-weight: 600; font-size: 0.8em; border: 1px solid rgba(74, 222, 128, 0.3);
+    }}
+    .status-pill.stopped {{
+      background: rgba(248, 113, 113, 0.12); color: var(--red);
+      border-color: rgba(248, 113, 113, 0.3);
+    }}
+    .status-dot {{
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--green); animation: pulse 2s infinite;
+    }}
+    .status-pill.stopped .status-dot {{ background: var(--red); animation: none; }}
+    @keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
+
+    /* Grid layout */
+    .grid {{ display: grid; gap: 1em; grid-template-columns: 1fr 1fr; }}
+    @media (max-width: 700px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+    .card {{
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 12px; padding: 1.25em 1.5em;
+    }}
+    .card-full {{ grid-column: 1 / -1; }}
+    .card h3 {{
+      font-size: 0.75em; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 1em;
+    }}
+
+    /* Stat tiles */
+    .stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75em; }}
+    .stat {{
+      background: var(--panel-2); border-radius: 8px; padding: 0.9em 1em;
+      border: 1px solid var(--border);
+    }}
+    .stat-value {{ font-size: 1.6em; font-weight: 700; line-height: 1.1; }}
+    .stat-label {{ font-size: 0.7em; color: var(--text-dim); text-transform: uppercase;
+                  letter-spacing: 0.05em; margin-top: 0.3em; }}
+    .stat.accent .stat-value {{ color: var(--accent); }}
+    .stat.green .stat-value {{ color: var(--green); }}
+    .stat.yellow .stat-value {{ color: var(--yellow); }}
+
+    /* Progress bars */
+    .progress-row {{
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 0.5em; font-size: 0.85em;
+    }}
+    .progress-row .label {{ color: var(--text-dim); }}
+    .progress-row .value {{ font-weight: 600; font-variant-numeric: tabular-nums; }}
+    .progress-bar {{
+      height: 8px; background: var(--panel-2); border-radius: 4px;
+      overflow: hidden; margin-bottom: 1em;
+    }}
+    .progress-fill {{
+      height: 100%; background: var(--accent); border-radius: 4px;
+      transition: width 0.5s ease;
+    }}
+    .progress-fill.green {{ background: var(--green); }}
+    .progress-fill.yellow {{ background: var(--yellow); }}
+
+    /* Current item */
+    .current-item {{
+      background: var(--panel-2); border-radius: 8px; padding: 0.9em 1em;
+      border-left: 3px solid var(--accent); margin-top: 0.5em;
+    }}
+    .current-item.idle {{ border-left-color: var(--text-dim); opacity: 0.6; }}
+    .current-item .ci-row {{
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.85em;
+    }}
+    .current-item .ci-label {{ color: var(--text-dim); }}
+    .current-item .ci-value {{ font-weight: 600; font-variant-numeric: tabular-nums; }}
+    code {{ background: var(--bg); padding: 0.15em 0.4em; border-radius: 4px;
+            font-size: 0.85em; color: var(--blue); }}
+
+    /* Controls */
+    .controls {{ display: flex; gap: 0.75em; flex-wrap: wrap; }}
+    button {{
+      flex: 1; min-width: 140px;
+      padding: 0.75em 1em; border: none; border-radius: 8px;
+      font-size: 0.9em; font-weight: 600; cursor: pointer;
+      transition: all 0.15s ease; color: white;
+    }}
+    button:hover {{ transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
+    button:active {{ transform: translateY(0); }}
+    button.stop {{ background: var(--red); }}
+    button.stop:hover {{ background: #ef4444; }}
+    button.reset {{ background: var(--blue); }}
+    button.reset:hover {{ background: #3b82f6; }}
+
+    /* Config display */
+    .config-grid {{ display: grid; grid-template-columns: auto 1fr; gap: 0.5em 1.5em; font-size: 0.85em; }}
+    .config-grid .ck {{ color: var(--text-dim); }}
+    .config-grid .cv {{ font-weight: 500; font-variant-numeric: tabular-nums; }}
+
+    /* JSON viewer (collapsible) */
+    details {{ margin-top: 0.5em; }}
+    summary {{
+      cursor: pointer; color: var(--text-dim); font-size: 0.8em;
+      padding: 0.5em 0; user-select: none;
+    }}
+    summary:hover {{ color: var(--text); }}
+    pre {{
+      background: var(--bg); color: #a3d4a3; padding: 1em; border-radius: 8px;
+      overflow: auto; font-size: 0.75em; line-height: 1.4;
+      font-family: 'SF Mono', Monaco, Consolas, monospace;
+      max-height: 400px; overflow-y: auto;
+    }}
+
+    .footer {{
+      text-align: center; color: var(--text-dim); font-size: 0.75em;
+      padding: 1em 0; margin-top: 1em;
+    }}
+    .footer a {{ color: var(--accent); text-decoration: none; }}
   </style>
 </head>
 <body>
-  <h1>Telegram Bulk Forwarder <span class="badge">{status_text}</span></h1>
-  <p class="meta">uptime: {uptime_str} · requests served: {self._request_count}</p>
+  <div class="container">
 
-  <div class="card">
-    <h3>Configuration</h3>
-    <p>Target: <code>{target}</code></p>
-    <p>Filter: <code>{filter_str}</code> · Order: <code>{order}</code></p>
-  </div>
-
-  <div class="card">
-    <h3>Progress</h3>
-    <div class="row">
-      <div>
-        <h4>Current Sweep #{sweep_num}</h4>
-        <p>📦 {items_in_sweep} items</p>
-        <p>📨 {msgs_in_sweep} msgs</p>
-        <p>↪ {skipped_in_sweep} skipped</p>
+    <!-- Header -->
+    <div class="header">
+      <div class="header-left">
+        <div>
+          <h1>📡 Telegram Bulk Forwarder</h1>
+          <div class="header-sub">
+            uptime <span id="uptime">{uptime_str}</span> ·
+            requests <span id="req-count">{self._request_count}</span> ·
+            last sync <span id="last-sync">never</span>
+          </div>
+        </div>
       </div>
-      <div>
-        <h4>Cumulative</h4>
-        <p>📦 {total_items} items</p>
-        <p>📨 {total_msgs} msgs</p>
-        <p>↪ {total_skipped} skipped</p>
+      <div id="status-pill" class="status-pill {status_dot_class}">
+        <span class="status-dot"></span>
+        <span id="status-text">{status_text}</span>
       </div>
     </div>
-    {current_html}
-    {upload_html}
-    {batch_html}
+
+    <!-- Top stats -->
+    <div class="grid">
+      <div class="card">
+        <h3>📦 This Sweep</h3>
+        <div class="stats">
+          <div class="stat accent">
+            <div class="stat-value" id="sweep-num">#{snap.get('sweep_num', 0)}</div>
+            <div class="stat-label">Sweep</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="items-in-sweep">{snap.get('items_in_sweep', 0)}</div>
+            <div class="stat-label">Items sent</div>
+          </div>
+          <div class="stat yellow">
+            <div class="stat-value" id="skipped-in-sweep">{snap.get('skipped_in_sweep', 0)}</div>
+            <div class="stat-label">Skipped</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>📊 Cumulative</h3>
+        <div class="stats">
+          <div class="stat green">
+            <div class="stat-value" id="total-items">{snap.get('total_items_sent', 0)}</div>
+            <div class="stat-label">Items sent</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="total-msgs">{snap.get('total_msgs_sent', 0)}</div>
+            <div class="stat-label">Messages</div>
+          </div>
+          <div class="stat yellow">
+            <div class="stat-value" id="total-skipped">{snap.get('total_skipped', 0)}</div>
+            <div class="stat-label">Skipped</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Progress + current item -->
+    <div class="grid">
+      <div class="card">
+        <h3>⚡ Current Burst</h3>
+        <div id="burst-info">
+          <div class="progress-row">
+            <span class="label">Batch progress</span>
+            <span class="value" id="batch-progress-text">—</span>
+          </div>
+          <div class="progress-bar"><div id="batch-progress-fill" class="progress-fill" style="width:0%"></div></div>
+
+          <div class="progress-row">
+            <span class="label">Pause countdown</span>
+            <span class="value" id="pause-countdown">—</span>
+          </div>
+          <div class="progress-bar"><div id="pause-progress-fill" class="progress-fill yellow" style="width:0%"></div></div>
+        </div>
+
+        <div class="current-item idle" id="current-item">
+          <div class="ci-row">
+            <span class="ci-label">Current item</span>
+            <span class="ci-value" id="ci-status">idle</span>
+          </div>
+          <div class="ci-row" style="margin-top:0.3em">
+            <span class="ci-label">msg_id</span>
+            <span class="ci-value"><code id="ci-id">—</code></span>
+          </div>
+          <div class="ci-row" style="margin-top:0.3em">
+            <span class="ci-label">kind</span>
+            <span class="ci-value" id="ci-kind">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>⚙️ Configuration</h3>
+        <div class="config-grid">
+          <span class="ck">Target</span><span class="cv"><code>{target}</code></span>
+          <span class="ck">Filter</span><span class="cv">{filter_str}</span>
+          <span class="ck">Order</span><span class="cv">{order}</span>
+          <span class="ck">Watermark</span><span class="cv" id="watermark">last_offset_id={last_offset_id}</span>
+          <span class="ck">In state</span><span class="cv" id="state-count">{state_sent_count} ids</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="card card-full">
+      <h3>🎛️ Controls</h3>
+      <div class="controls">
+        <button class="stop" onclick="stopBot()">⏹ Stop bot</button>
+        <button class="reset" onclick="resetWatermark()">↻ Reset watermark</button>
+      </div>
+      <p style="color:var(--text-dim); font-size:0.75em; margin-top:1em; line-height:1.6">
+        <strong>Stop bot</strong>: halts gracefully after the current item (POST /stop)<br>
+        <strong>Reset watermark</strong>: next sweep re-scans from id=1 — items already in <code>sent_ids</code> are still skipped (POST /reset)
+      </p>
+    </div>
+
+    <!-- Raw JSON (collapsible) -->
+    <div class="card card-full">
+      <h3>📜 Raw JSON status</h3>
+      <details>
+        <summary>Click to expand raw JSON (live-updated)</summary>
+        <pre id="raw-json">{snap_json_escaped}</pre>
+      </details>
+    </div>
+
+    <div class="footer">
+      Telegram Bulk Forwarder · <a href="/health">health</a> · <a href="/status">JSON</a> ·
+      auto-refresh every 2s · <span id="footer-time"></span>
+    </div>
+
   </div>
 
-  <div class="card">
-    <h3>Controls</h3>
-    <p>
-      <button onclick="if(confirm('Stop the bot?')) fetch('/stop',{{method:'POST'}}).then(()=>location.reload())">
-        Stop bot
-      </button>
-      <button style="background:#1976d2" onclick="if(confirm('Reset auto-resume watermark? Next sweep will re-scan from id=1 (items already marked sent will still be skipped).')) fetch('/reset',{{method:'POST'}}).then(()=>location.reload())">
-        Reset watermark
-      </button>
-    </p>
-    <p class="meta">
-      Auto-resume watermark: <code>last_offset_id={last_offset_id}</code>
-      ({state_sent_count} items marked sent in state.json)
-    </p>
-    <p class="meta">
-      Also available:
-      <code>curl -X POST .../stop</code> ·
-      <code>curl -X POST .../reset</code>
-    </p>
-  </div>
+  <script>
+    // Live AJAX polling — update dashboard every 2s without full page reload.
+    let pollCount = 0;
+    async function poll() {{
+      try {{
+        const res = await fetch('/status');
+        const s = await res.json();
+        pollCount++;
+        const now = new Date();
+        const ts = now.toLocaleTimeString();
 
-  <div class="card">
-    <h3>Raw JSON</h3>
-    <pre>{snap_json}</pre>
-  </div>
+        // Status pill
+        const stopped = s.stopped;
+        const pill = document.getElementById('status-pill');
+        pill.className = 'status-pill ' + (stopped ? 'stopped' : 'running');
+        document.getElementById('status-text').textContent = stopped ? 'STOPPED' : 'RUNNING';
 
-  <p class="meta">Auto-refresh in 10s… <script>setTimeout(()=>location.reload(),10000)</script></p>
+        // Header sub
+        document.getElementById('last-sync').textContent = ts;
+        document.getElementById('req-count').textContent = s.req_count || pollCount;
+
+        // Stats
+        document.getElementById('sweep-num').textContent = '#' + (s.sweep_num || 0);
+        document.getElementById('items-in-sweep').textContent = s.items_in_sweep || 0;
+        document.getElementById('skipped-in-sweep').textContent = s.skipped_in_sweep || 0;
+        document.getElementById('total-items').textContent = s.total_items_sent || 0;
+        document.getElementById('total-msgs').textContent = s.total_msgs_sent || 0;
+        document.getElementById('total-skipped').textContent = s.total_skipped || 0;
+
+        // Batch progress (use items_in_batch / batch_size if available, else 0)
+        const batchSize = s.batch_size || 30;
+        const itemsInBatch = s.items_in_batch || (s.batch_pause_active ? batchSize : 0);
+        const batchPct = Math.min(100, (itemsInBatch / batchSize) * 100);
+        document.getElementById('batch-progress-fill').style.width = batchPct + '%';
+        document.getElementById('batch-progress-text').textContent =
+          itemsInBatch + ' / ' + batchSize + ' msgs (' + batchPct.toFixed(0) + '%)';
+
+        // Pause countdown
+        if (s.batch_pause_active) {{
+          const remaining = s.batch_pause_remaining || 0;
+          const total = s.batch_pause_total || 60;
+          const pausePct = ((total - remaining) / total) * 100;
+          document.getElementById('pause-progress-fill').style.width = pausePct + '%';
+          document.getElementById('pause-countdown').textContent = remaining.toFixed(0) + 's remaining';
+        }} else {{
+          document.getElementById('pause-progress-fill').style.width = '0%';
+          document.getElementById('pause-countdown').textContent = 'not pausing';
+        }}
+
+        // Current item
+        const ci = document.getElementById('current-item');
+        if (s.current_item_id) {{
+          ci.classList.remove('idle');
+          document.getElementById('ci-status').textContent = 'sending';
+          document.getElementById('ci-id').textContent = s.current_item_id;
+          document.getElementById('ci-kind').textContent = s.current_item_kind || '—';
+        }} else {{
+          ci.classList.add('idle');
+          document.getElementById('ci-status').textContent = 'idle';
+          document.getElementById('ci-id').textContent = '—';
+          document.getElementById('ci-kind').textContent = '—';
+        }}
+
+        // Watermark + state count
+        document.getElementById('watermark').textContent = 'last_offset_id=' + (s.last_offset_id || 0);
+        document.getElementById('state-count').textContent = (s.state_sent_ids_count || 0) + ' ids';
+
+        // Raw JSON (re-render only if expanded to avoid scroll reset)
+        const details = document.querySelector('details');
+        if (details.open) {{
+          document.getElementById('raw-json').textContent = JSON.stringify(s, null, 2);
+        }}
+
+        document.getElementById('footer-time').textContent = ts;
+      }} catch (e) {{
+        console.error('poll failed:', e);
+      }}
+    }}
+
+    function stopBot() {{
+      if (confirm('Stop the bot? It will halt after the current item.')) {{
+        fetch('/stop', {{method: 'POST'}}).then(() => setTimeout(poll, 500));
+      }}
+    }}
+    function resetWatermark() {{
+      if (confirm('Reset auto-resume watermark?\\nNext sweep will re-scan from id=1.\\nItems already in sent_ids will still be skipped.')) {{
+        fetch('/reset', {{method: 'POST'}}).then(() => setTimeout(poll, 500));
+      }}
+    }}
+
+    // Initial poll + interval.
+    poll();
+    setInterval(poll, 2000);
+  </script>
 </body>
 </html>
 """

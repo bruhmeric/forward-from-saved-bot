@@ -319,13 +319,14 @@ async def _sweep(
         batch.extend(msgs)
         batch_ids.extend(ids)
 
-        # If batch is full, forward it.
+        # If batch is full (measured in MESSAGES, not items — one item can be 50 msgs),
+        # forward it.
         if len(batch) >= cfg.batch_size:
             await limiter.pace()
             first_id = batch_ids[0]
-            kind_label = message_kind(batch[0]) or "unknown"
-            if len(batch) > 1:
-                kind_label = f"album({len(batch)}×{kind_label})"
+            # Simple label: "50×video" or just "video" if single
+            kind = message_kind(batch[0]) or "unknown"
+            kind_label = f"{len(batch)}×{kind}" if len(batch) > 1 else kind
             tracker.item_start(first_id, kind_label, n_msgs=len(batch))
             await tp.update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
 
@@ -351,7 +352,10 @@ async def _sweep(
             batch_ids = []
 
             # Burst pause — wait until batch_interval_sec since this burst started.
-            if tracker.items_in_batch >= cfg.batch_size:
+            # Note: items_in_batch counts ITEMS (forward_messages calls), not messages.
+            # An "item" might contain many messages (e.g. 50 videos forwarded in one call).
+            # We pause after each forward_messages call to stay under Telegram's rate limit.
+            if tracker.items_in_batch >= 1:
                 tracker.batch_pause_start()
                 await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
                 batch_total = float(limiter.batch_interval_sec)
@@ -367,7 +371,7 @@ async def _sweep(
                 tracker.batch_pause_end()
                 limiter.start_burst()
                 print(f"[sweep] starting burst #{tracker.batch_num + 1} "
-                      f"(target: {cfg.batch_size} items in {cfg.batch_interval_sec}s)")
+                      f"(target: {cfg.batch_size} msgs in {cfg.batch_interval_sec}s)")
                 await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
                 if stop_watcher.stop_requested():
                     break
@@ -376,9 +380,8 @@ async def _sweep(
     if batch:
         await limiter.pace()
         first_id = batch_ids[0]
-        kind_label = message_kind(batch[0]) or "unknown"
-        if len(batch) > 1:
-            kind_label = f"album({len(batch)}×{kind_label})"
+        kind = message_kind(batch[0]) or "unknown"
+        kind_label = f"{len(batch)}×{kind}" if len(batch) > 1 else kind
         tracker.item_start(first_id, kind_label, n_msgs=len(batch))
         try:
             await _forward_batch(client, cfg.target, batch, limiter)
@@ -425,6 +428,8 @@ async def run_forwarder(
             "target": snap.target,
             "filter_types": sorted(snap.filter_types),
             "order": snap.order,
+            "batch_size": cfg.batch_size,                # msgs per burst (for UI progress bar)
+            "items_in_batch": tracker.items_in_batch,    # items sent in current burst
             "sweep_num": snap.sweep_num,
             "items_in_sweep": snap.items_in_sweep,
             "msgs_in_sweep": snap.msgs_in_sweep,
@@ -440,6 +445,7 @@ async def run_forwarder(
             "upload_total": snap.upload_total,
             "batch_pause_active": snap.batch_pause_active,
             "batch_pause_remaining": snap.batch_pause_remaining,
+            "batch_pause_total": snap.batch_pause_total,
             "batch_num": snap.batch_num,
             "stopped": snap.stopped,
             "stop_reason": snap.stop_reason,

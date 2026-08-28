@@ -28,7 +28,7 @@ class Config:
 
     # Behaviour
     order: str                        # "new" or "old"
-    batch_size: int                   # items per burst (default 50)
+    batch_size: int                   # MESSAGES per burst (NOT items — one item can be 50 msgs)
     per_message_delay: float          # seconds between sends WITHIN a burst (default 0.5)
     batch_interval_sec: int           # seconds between burst STARTS (default 60 = 50/min throughput)
     stop_poll_interval: int           # seconds between Saved Messages polls
@@ -41,7 +41,7 @@ class Config:
 
     # Scan limit — caps total messages collected per sweep when ORDER=old
     # (avoids runaway memory + FloodWait when Saved Messages is huge)
-    max_scan: int = 5000                # 0 = unlimited
+    max_scan: int = 11000               # 0 = unlimited
     page_delay: float = 0.4            # delay between get_chat_history pages (avoids FloodWait)
 
     # Telegram-side live progress reporter (defaults OFF — web UI is the primary interface)
@@ -67,8 +67,8 @@ class Config:
             raise ValueError(f"Unknown filter types {bad}. Valid: {valid}")
         if not self.filter_types:
             raise ValueError("FILTER is empty — choose at least one of photo,video,animation")
-        if self.batch_size < 1 or self.batch_size > 50:
-            raise ValueError("BATCH_SIZE must be between 1 and 50")
+        if self.batch_size < 1 or self.batch_size > 100:
+            raise ValueError("BATCH_SIZE must be between 1 and 100 (messages per burst)")
         if self.batch_interval_sec < 10:
             # Telegram tolerates ~50 msg/min sustained to a single chat.
             # Going below 10s = 300 msg/min will definitely FloodWait.
@@ -134,7 +134,7 @@ def from_env(cli_overrides: dict | None = None) -> Config:
     target     = cli.get("target") or os.environ.get("TARGET") or ""
     filter_raw = cli.get("filter") or os.environ.get("FILTER") or "photo,video,animation"
     order      = (cli.get("order") or os.environ.get("ORDER") or "old").lower()
-    batch_size = int(cli.get("batch_size") or os.environ.get("BATCH_SIZE") or "50")
+    batch_size = int(cli.get("batch_size") or os.environ.get("BATCH_SIZE") or "30")
     # Default 0.5s between sends WITHIN a burst (50 items × 0.5s = 25s burst).
     per_msg    = float(cli.get("per_message_delay") or os.environ.get("PER_MESSAGE_DELAY") or "0.5")
     # Default 60s between burst STARTS → 50 items / 60s = 50 items/min.
@@ -144,7 +144,7 @@ def from_env(cli_overrides: dict | None = None) -> Config:
     bp_max     = int(cli.get("batch_pause_max") or os.environ.get("BATCH_PAUSE_MAX") or "0")
     stop_int   = int(cli.get("stop_poll_interval") or os.environ.get("STOP_POLL_INTERVAL") or "5")
     state_file = cli.get("state_file") or os.environ.get("STATE_FILE") or "./state.json"
-    max_scan   = int(cli.get("max_scan") or os.environ.get("MAX_SCAN") or "5000")
+    max_scan   = int(cli.get("max_scan") or os.environ.get("MAX_SCAN") or "11000")
     page_delay = float(cli.get("page_delay") or os.environ.get("PAGE_DELAY") or "0.4")
 
     # Telegram-side live progress (defaults OFF — web UI is the primary interface)

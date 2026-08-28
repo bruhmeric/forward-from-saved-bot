@@ -57,8 +57,11 @@ services:
         value: photo,video,animation
       - key: ORDER
         value: old
+      # MESSAGES per burst (NOT items — one grouped_id batch can be 50 messages).
+      # Default 30 = under Telegram's per-chat sustained limit (~30 msg/min).
+      # Combined with BATCH_INTERVAL_SEC=60, this gives ~30 messages/minute throughput.
       - key: BATCH_SIZE
-        value: "50"
+        value: "30"
       # Within-burst delay: 0.5s between sends → 50 items in ~25s.
       - key: PER_MESSAGE_DELAY
         value: "0.5"
@@ -67,10 +70,10 @@ services:
       - key: BATCH_INTERVAL_SEC
         value: "60"
       # Cap on total Saved Messages scanned per sweep (avoids runaway memory + FloodWait
-      # when Saved Messages is huge). 0 = unlimited. Default 10000 ≈ 20 MB peak RAM.
+      # when Saved Messages is huge). 0 = unlimited. Default 11000 ≈ 22 MB peak RAM.
       # Lower this if you're hitting Render free-tier RAM limits (512 MB).
       - key: MAX_SCAN
-        value: "10000"
+        value: "11000"
       # Delay (seconds) between get_chat_history pagination calls — prevents Telegram's
       # GetHistory FloodWait penalty (which forces 24s+ waits).
       - key: PAGE_DELAY
