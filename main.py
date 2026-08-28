@@ -41,7 +41,7 @@ from web_server import WebServer
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Telegram Saved Messages bulk forwarder (user session via Pyrogram)."
+        description="Telegram Saved Messages bulk forwarder (Telethon user session)."
     )
     p.add_argument("--target",     help="Destination channel/group (@username or -100… id).")
     p.add_argument("--filter",     help="Comma-separated: photo,video,animation (default: all).")
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
                    help="Delay (seconds) between get_chat_history pages (default 0.4; prevents FloodWait).")
     p.add_argument("--api-id",     help="Telegram API_ID (or set API_ID env).")
     p.add_argument("--api-hash",   help="Telegram API_HASH (or set API_HASH env).")
-    p.add_argument("--session-string", help="Pyrogram StringSession (or set SESSION_STRING env).")
+    p.add_argument("--session-string", help="Telethon StringSession (or set SESSION_STRING env).")
     p.add_argument("--state-file", help="Path to state.json (default ./state.json).")
     p.add_argument("--telegram-progress", choices=["1","0","on","off"],
                    help="Post live progress to a Telegram chat (1=on, 0=off). Default on.")

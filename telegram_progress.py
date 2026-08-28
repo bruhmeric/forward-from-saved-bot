@@ -23,9 +23,14 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from pyrogram import Client
+if TYPE_CHECKING:
+    # Avoid importing telethon at module load — TelegramProgress is constructed
+    # with a client object, but we don't actually use any telethon-specific
+    # types in our annotations. This keeps the module importable even if
+    # telethon isn't installed (e.g. during development).
+    from telethon import TelegramClient
 
 
 @dataclass
