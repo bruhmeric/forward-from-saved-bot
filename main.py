@@ -296,36 +296,55 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     print(f"[main] connected as {first_name} (@{username or '—'}) id={uid}")
 
     # CRITICAL: Resolve the target peer BEFORE the forwarder starts sending.
-    # StringSession stores NO entity cache, so the first time we use a numeric
-    # id like -1004343021949, Telethon has no access_hash for it and fails
-    # with "Cannot find any entity corresponding to ...".
     #
-    # Fix: call get_dialogs() once to populate the session cache with all the
-    # user's chats (channels, groups, DMs). After this, get_entity(numeric_id)
-    # works because the access_hash is cached in memory.
+    # Telethon's StringSession stores no entity cache, AND its string-resolution
+    # path can't parse numeric-looking strings like "-1004343021949" as IDs.
+    # The fix: construct a PeerChannel object directly from the raw channel_id,
+    # then call get_input_entity() which uses the "access_hash=0 trick" —
+    # Telegram returns the full Channel (with real access_hash) for any channel
+    # the account can access (i.e., is a member of).
     #
-    # If the target is a @username, get_entity() works without this warmup —
-    # but we do it anyway to also enable replying to /stop and /status commands
-    # sent to Saved Messages from various Telegram clients.
-    print(f"[main] warming up session cache (fetching dialogs)…")
-    try:
-        dialog_count = 0
-        async for _ in client.iter_dialogs():
-            dialog_count += 1
-        print(f"[main] ✓ session cache warmed up: {dialog_count} dialogs indexed")
-    except Exception as e:
-        print(f"[main] WARNING: dialog warmup failed: {e!r}")
-        print("[main] (continuing — target resolution may fail for numeric ids)")
-
+    # This works on a fresh StringSession with ZERO warmup needed.
+    # Source: https://github.com/LonamiWebs/Telethon/issues/4084
     print(f"[main] resolving target peer {cfg.target!r}…")
     try:
-        target_entity = await client.get_entity(cfg.target)
+        # Try to parse the target as a numeric id with -100 prefix.
+        # If TARGET="-1004343021949" → PeerChannel(4343021949)
+        # If TARGET="@username" → fall through to get_entity (string path works for usernames)
+        # If TARGET="-1001234567890" (int via env) → PeerChannel(1234567890)
+        target_input = None
+        target_str = str(cfg.target).strip()
+
+        # Case 1: numeric string starting with -100 (channel/supergroup id)
+        if target_str.startswith("-100") and target_str[4:].isdigit():
+            raw_id = int(target_str[4:])  # strip the -100 prefix
+            from telethon.tl.types import PeerChannel
+            target_input = PeerChannel(raw_id)
+            print(f"[main] parsed as channel id: PeerChannel(channel_id={raw_id})")
+        # Case 2: negative int (already passed as int from env)
+        elif isinstance(cfg.target, int) and cfg.target < -1000000000000:
+            raw_id = -cfg.target - 1000000000000  # strip the -100 mark
+            from telethon.tl.types import PeerChannel
+            target_input = PeerChannel(raw_id)
+            print(f"[main] parsed as channel id (int input): PeerChannel(channel_id={raw_id})")
+        # Case 3: @username or other string — let get_entity handle it
+        else:
+            target_input = cfg.target
+
+        # Resolve via get_input_entity (uses access_hash=0 trick for PeerChannel)
+        target_entity = await client.get_input_entity(target_input)
         title = (getattr(target_entity, "title", None)
                  or getattr(target_entity, "first_name", None)
                  or getattr(target_entity, "username", None)
                  or "?")
-        cid = getattr(target_entity, "id", "?")
+        cid = getattr(target_entity, "channel_id", None) or getattr(target_entity, "user_id", None) or getattr(target_entity, "chat_id", None) or "?"
         print(f"[main] ✓ target resolved: {title!r} (id={cid})")
+
+        # IMPORTANT: Replace cfg.target with the resolved InputPeer object so
+        # that all downstream calls (forward_messages, etc.) use the cached
+        # access_hash and don't re-trigger the string-resolution bug.
+        cfg.target = target_entity
+        print(f"[main] target stored as resolved InputPeer for downstream use")
     except Exception as e:
         print()
         print("=" * 70)
@@ -349,11 +368,6 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         print("  4. For supergroups/channels, the id format MUST be -100<id>")
         print("     (e.g., -1001234567890). Without the -100 prefix, Telegram")
         print("     treats it as a user id and resolution fails.")
-        print()
-        print("  5. ⚠️  If you're sure the id is correct and you're a member,")
-        print("     try using the channel's @username instead — some private")
-        print("     channels don't expose their numeric id to the API even")
-        print("     when you're an admin.")
         print()
         raise SystemExit(1)
 
