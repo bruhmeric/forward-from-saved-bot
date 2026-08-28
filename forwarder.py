@@ -92,9 +92,13 @@ async def iter_units(
       - a single non-album message  → ([id], [msg])
       - a complete album             → ([id1,id2,…], [msg1,msg2,…])
 
+    Album handling: when we encounter a message with `grouped_id`, we
+    collect ALL subsequent messages with the same grouped_id into one unit.
+    This ensures album members are always forwarded together (server-side
+    regrouping by `forward_messages`).
+
     Telethon's iter_messages handles pagination, reverse, min_id, and
-    server-side filtering all in one call. No manual offset_id walking,
-    no PAGE_DELAY, no "load all into memory" gymnastics.
+    server-side filtering all in one call.
     """
     seen_in_session: set[int] = set()
     msg_filter = _select_telethon_filter(cfg.filter_types)
@@ -108,10 +112,6 @@ async def iter_units(
     else:
         print(f"[iter] starting fresh scan (filter={sorted(cfg.filter_types)}, reverse={reverse})")
 
-    # iter_messages with reverse=True yields oldest-first, with min_id as
-    # the exclusive lower bound (only messages with id > min_id).
-    # Note: with reverse=True, offset_id semantics flip — but min_id still works
-    # as the lower bound.
     iterator = client.iter_messages(
         "me",
         filter=msg_filter if not isinstance(msg_filter, InputMessagesFilterEmpty) else None,
@@ -123,6 +123,9 @@ async def iter_units(
     )
 
     count_seen = 0
+    current_album_msgs: List[TelethonMessage] = []
+    current_album_grouped_id = None
+
     async for m in iterator:
         if m is None:
             continue
@@ -132,28 +135,42 @@ async def iter_units(
         if count_seen % 200 == 0:
             print(f"[iter] scanned {count_seen} messages so far…")
 
-        # Telethon groups albums by `m.grouped_id` (same as Pyrogram's media_group_id).
+        # Telethon groups albums by `m.grouped_id`.
         grouped_id = getattr(m, "grouped_id", None)
-        if grouped_id:
-            # Fetch the full album by searching for messages with the same grouped_id.
-            # Note: server-side filter (InputMessagesFilterVideo) does NOT support
-            # grouped_id filtering, so we use no filter here.
-            try:
-                album_msgs = []
-                async for am in client.iter_messages("me", min_id=max(0, m.id - 50), max_id=m.id + 50, limit=100):
-                    if getattr(am, "grouped_id", None) == grouped_id:
-                        album_msgs.append(am)
-                if not album_msgs:
-                    album_msgs = [m]
-            except Exception as e:
-                print(f"[iter] could not fetch media group for msg_id={m.id}: {e!r}; treating as single")
-                album_msgs = [m]
-            ids = [x.id for x in album_msgs if x is not None]
-            seen_in_session.update(ids)
-            yield ids, album_msgs
-        else:
+
+        if grouped_id is None:
+            # Not part of an album. If we were collecting an album, flush it first.
+            if current_album_msgs:
+                ids = [x.id for x in current_album_msgs]
+                seen_in_session.update(ids)
+                yield ids, current_album_msgs
+                current_album_msgs = []
+                current_album_grouped_id = None
+            # Yield the single message.
             seen_in_session.add(m.id)
             yield [m.id], [m]
+        else:
+            # Part of an album.
+            if current_album_grouped_id is None:
+                # Start a new album.
+                current_album_grouped_id = grouped_id
+                current_album_msgs = [m]
+            elif current_album_grouped_id == grouped_id:
+                # Same album — accumulate.
+                current_album_msgs.append(m)
+            else:
+                # Different album — flush the old one, start a new one.
+                ids = [x.id for x in current_album_msgs]
+                seen_in_session.update(ids)
+                yield ids, current_album_msgs
+                current_album_grouped_id = grouped_id
+                current_album_msgs = [m]
+
+    # Flush any remaining album at the end of iteration.
+    if current_album_msgs:
+        ids = [x.id for x in current_album_msgs]
+        seen_in_session.update(ids)
+        yield ids, current_album_msgs
 
 
 # ----------------------------------------------------------------------
@@ -170,8 +187,11 @@ async def _forward_batch(
     Forward a batch of up to 100 messages to the target channel.
     Strips captions (drop_media_captions=True) AND forward headers (drop_author=True).
 
-    Telethon's forward_messages does this in a SINGLE MTProto call, vs Pyrogram's
-    per-message copy_message which was 50x slower.
+    Telethon's forward_messages does this in a SINGLE MTProto call.
+
+    IMPORTANT: when passing integer IDs (instead of Message objects), Telethon
+    requires `from_peer` to be set explicitly. We pass from_peer="me" since all
+    messages come from Saved Messages.
     """
     if not msgs:
         return
@@ -185,11 +205,11 @@ async def _forward_batch(
     async def send_fn():
         # drop_media_captions=True strips captions.
         # drop_author=True is REQUIRED by Telegram when drop_media_captions=True.
-        # The result: destination receives a clean copy with no caption and no
-        # "forwarded from" header.
+        # from_peer="me" is REQUIRED when passing integer IDs (Telethon enforces this).
         return await client.forward_messages(
             target,
             msg_ids,
+            from_peer="me",
             drop_author=True,
             drop_media_captions=True,
         )
