@@ -247,7 +247,7 @@ In all cases, the bot finishes the current item, saves state (and mirrors it to 
 | `SESSION_STRING` | — | Pyrogram StringSession from `session_setup.py` (required) |
 | `TARGET` | — | Destination `@username` or `-100…` id (required) |
 | `FILTER` | `photo,video,animation` | Comma-separated subset of {photo, video, animation} |
-| `ORDER` | `old` | `new` (newest first) or `old` (oldest first — DEFAULT) |
+| `ORDER` | `old` | `new` (newest first) or `old` (oldest first — DEFAULT). Note: `old` requires loading ALL Saved Messages into memory before forwarding starts (Pyrogram 2.0.106 doesn't support `reverse=True`). For 10,000+ saved items, consider `ORDER=new` to stream. |
 | `BATCH_SIZE` | `50` | Items per batch before long pause (1-50) |
 | `PER_MESSAGE_DELAY` | `2.5` | Seconds between individual sends |
 | `BATCH_PAUSE_MIN` | `120` | Min seconds pause after each batch |

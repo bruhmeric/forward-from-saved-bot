@@ -43,11 +43,75 @@ async def iter_units(client: Client, order: str) -> AsyncIterator[Unit]:
     A "unit" is either:
       - a single non-album message  → ([id], [msg])
       - a complete album            → ([id1,id2,…], [msg1,msg2,…])
+
+    Order handling:
+      - "new" (newest first): iterate directly via get_chat_history()
+      - "old" (oldest first): collect ALL messages into memory (paginating
+        backward via offset_id), reverse the list, then yield oldest-first.
+
+        Pyrogram 2.0.106's get_chat_history() does NOT support reverse=True,
+        so for oldest-first we have to materialize the full history in RAM
+        before yielding anything. For typical Saved Messages sizes (a few
+        thousand items) this is fine — each Message object is ~1-2 KB, so
+        10,000 items = ~20 MB peak. If you have hundreds of thousands of
+        saved items, switch to ORDER=new.
     """
-    reverse = (order == "old")
     seen_in_session: set[int] = set()
 
-    async for m in client.get_chat_history("me", reverse=reverse):
+    if order == "old":
+        # Collect ALL Saved Messages into a list, paginating backward.
+        all_msgs: list = []
+        offset_id = 0
+        page_num = 0
+        while True:
+            page_num += 1
+            page_msgs: list = []
+            kwargs = {"limit": 100}
+            if offset_id > 0:
+                kwargs["offset_id"] = offset_id
+            try:
+                async for m in client.get_chat_history("me", **kwargs):
+                    if m is not None:
+                        page_msgs.append(m)
+            except Exception as e:
+                print(f"[iter] get_chat_history page #{page_num} failed (offset_id={offset_id}): {e!r}")
+                break
+
+            if not page_msgs:
+                break  # reached the end
+
+            all_msgs.extend(page_msgs)
+            # offset_id = the LOWEST id in this page; next page returns messages with id < that
+            lowest_id = min(m.id for m in page_msgs)
+            if lowest_id == offset_id:
+                # No progress — bail to avoid infinite loop.
+                break
+            offset_id = lowest_id
+            if page_num % 10 == 0:
+                print(f"[iter] collected {len(all_msgs)} messages so far (page #{page_num})")
+
+        print(f"[iter] collected {len(all_msgs)} total messages; reversing for oldest-first")
+        all_msgs.reverse()  # now oldest-first
+
+        for m in all_msgs:
+            if m is None or m.id in seen_in_session:
+                continue
+            if m.media_group_id:
+                try:
+                    album = await client.get_media_group("me", m.id)
+                except Exception as e:
+                    print(f"[iter] could not fetch media group for msg_id={m.id}: {e!r}; treating as single")
+                    album = [m]
+                ids = [x.id for x in album if x is not None]
+                seen_in_session.update(ids)
+                yield ids, album
+            else:
+                seen_in_session.add(m.id)
+                yield [m.id], [m]
+        return
+
+    # Default path: newest-first (Pyrogram's natural order)
+    async for m in client.get_chat_history("me"):
         if m is None or m.id in seen_in_session:
             continue
 
