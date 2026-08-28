@@ -539,6 +539,21 @@ The bot now has a `PAGE_DELAY` env var (default `0.4` seconds) that throttles pa
 
 The `Waiting for 24 seconds…` message itself is **not fatal** — Pyrogram waits the requested time and then retries automatically. But it makes the scan slow. Set `PAGE_DELAY=0.5` to prevent it.
 
+### `PeerIdInvalid: [400 PEER_ID_INVALID] - The peer id being used is invalid or not known yet`
+
+This error means Pyrogram's session doesn't have an access hash cached for your target channel/group. The bot now calls `client.get_chat(target)` at startup to resolve the peer and cache the access hash automatically — so this error should NOT happen anymore on fresh deploys.
+
+If you still see it, the cause is one of:
+
+| Cause | Fix |
+|---|---|
+| **Target is a private channel/group you're not a member of** | Open the channel in your Telegram app and join it (or ask an admin to add you), then redeploy. |
+| **Target is a `@username` that doesn't exist** | Check the spelling. Telegram usernames are case-insensitive but must match otherwise. |
+| **Target is a numeric id like `-1001234567890` but you've never opened the chat from this account** | Open the chat once from your Telegram app (so your account has "met" the peer), then redeploy. |
+| **Numeric id missing the `-100` prefix** | For supergroups/channels, the id MUST be in the form `-100<id>` (e.g., `-1001234567890`). Without `-100`, Telegram treats it as a user id. |
+
+The startup logs will show `✓ target resolved: 'channel name' (id=…)` when the peer is successfully resolved, or a friendly error explaining what's wrong.
+
 ### Other common issues
 
 | Symptom | Likely cause / fix |

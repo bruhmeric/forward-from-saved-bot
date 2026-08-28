@@ -290,6 +290,50 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     me = await client.get_me()
     print(f"[main] connected as {me.first_name} (@{me.username or '—'}) id={me.id}")
 
+    # CRITICAL: Resolve the target peer BEFORE the forwarder starts sending.
+    # Without this, Pyrogram doesn't have an access_hash cached for the target
+    # channel/group, and every send will fail with:
+    #   PeerIdInvalid: [400 PEER_ID_INVALID] - The peer id being used is invalid or not known yet.
+    # Calling get_chat() once caches the access_hash in the in-memory session,
+    # so all subsequent copy_message / send_photo / etc. calls succeed.
+    print(f"[main] resolving target peer {cfg.target!r}…")
+    try:
+        target_chat = await client.get_chat(cfg.target)
+        # Pyrogram's Chat object has different attr shapes; try several.
+        title = (getattr(target_chat, "title", None)
+                 or getattr(target_chat, "first_name", None)
+                 or getattr(target_chat, "username", None)
+                 or "?")
+        cid = getattr(target_chat, "id", "?")
+        print(f"[main] ✓ target resolved: {title!r} (id={cid})")
+    except Exception as e:
+        print()
+        print("=" * 70)
+        print("❌ FAILED TO RESOLVE TARGET — bot will not be able to send anything")
+        print("=" * 70)
+        print(f"Error: {type(e).__name__}: {e}")
+        print()
+        print(f"TARGET is currently set to: {cfg.target!r}")
+        print()
+        print("Common causes:")
+        print()
+        print("  1. Target is a private channel/group and your account isn't a member.")
+        print("     Join the channel from your Telegram app first, then redeploy.")
+        print()
+        print("  2. Target is a @username that doesn't exist or is misspelled.")
+        print("     Check the spelling — Telegram usernames are case-insensitive")
+        print("     but must match exactly otherwise.")
+        print()
+        print("  3. Target is a numeric id (-1001234567890) but you've never")
+        print("     interacted with that chat from this account. Open it from")
+        print("     your Telegram app once, then redeploy.")
+        print()
+        print("  4. For supergroups/channels, the id format MUST be -100<id>")
+        print("     (e.g., -1001234567890). Without the -100 prefix, Telegram")
+        print("     treats it as a user id and resolution fails.")
+        print()
+        raise SystemExit(1)
+
     # Bootstrap state from Telegram (if enabled) — overrides local state.json
     # if a Telegram state doc exists (it's the more durable copy on free tier).
     if state_sync is not None:
