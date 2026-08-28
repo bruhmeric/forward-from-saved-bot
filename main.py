@@ -69,8 +69,8 @@ def parse_args() -> argparse.Namespace:
                    help="Mirror state.json to a Telegram chat so free-tier redeploys don't lose progress. Default on.")
     p.add_argument("--state-sync-interval", type=int,
                    help="How often to push state.json to Telegram (default 60s).")
-    p.add_argument("--rescan-interval", type=int, default=300,
-                   help="Seconds between full Saved Messages rescans (default 300).")
+    p.add_argument("--rescan-interval", type=int, default=60,
+                   help="Seconds between full Saved Messages rescans to pick up new items (default 60).")
     return p.parse_args()
 
 
@@ -158,8 +158,9 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     print(f"  filter         : {sorted(cfg.filter_types)}")
     print(f"  order          : {cfg.order}")
     print(f"  batch_size     : {cfg.batch_size}")
-    print(f"  per_message    : {cfg.per_message_delay}s")
-    print(f"  batch_pause    : {cfg.batch_pause_min}-{cfg.batch_pause_max}s")
+    print(f"  per_message    : {cfg.per_message_delay}s (within-burst delay)")
+    items_per_min = (cfg.batch_size * 60) / cfg.batch_interval_sec
+    print(f"  batch_interval : {cfg.batch_interval_sec}s (between burst starts → ~{items_per_min:.0f} items/min)")
     print(f"  max_scan       : {cfg.max_scan if cfg.max_scan > 0 else 'unlimited'}")
     print(f"  page_delay     : {cfg.page_delay}s")
     print(f"  state_file     : {cfg.state_file}")
@@ -180,11 +181,12 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     # State (sent IDs) — persisted file.
     state = State(path=cfg.state_file, target=cfg.target)
 
-    # Rate limiter.
+    # Rate limiter — burst pacing model:
+    #   - PER_MESSAGE_DELAY between sends within a burst (default 0.5s → 50 items in ~25s)
+    #   - BATCH_INTERVAL_SEC between burst STARTS (default 60s → ~50 items/min throughput)
     limiter = RateLimiter(
         per_message_delay=cfg.per_message_delay,
-        batch_pause_min=cfg.batch_pause_min,
-        batch_pause_max=cfg.batch_pause_max,
+        batch_interval_sec=cfg.batch_interval_sec,
     )
 
     # Stop watcher — runs as an asyncio task on Pyrogram's event loop.

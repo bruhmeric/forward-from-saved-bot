@@ -405,6 +405,11 @@ async def _sweep(
     if starting_offset > 0:
         print(f"[sweep] auto-resuming from id > {starting_offset} (last processed in prior sweep)")
 
+    # Mark the start of the FIRST burst — batch_pause() will wait until
+    # batch_interval_sec has elapsed since this timestamp.
+    limiter.start_burst()
+    print(f"[sweep] starting burst #1 (target: {cfg.batch_size} items in {cfg.batch_interval_sec}s)")
+
     async for ids, msgs in iter_units(client, cfg.order,
                                       max_scan=cfg.max_scan,
                                       page_delay=cfg.page_delay,
@@ -437,7 +442,7 @@ async def _sweep(
         else:
             kind_label = message_kind(matching[0]) or "unknown"
 
-        # Pre-send pacing.
+        # Pre-send pacing (within-burst delay).
         await limiter.pace()
 
         # Mark item start in the tracker.
@@ -466,22 +471,12 @@ async def _sweep(
         sent_this_sweep += 1
         await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
 
-        # Batch pause.
+        # Burst pause — wait until batch_interval_sec since this burst started.
         if tracker.items_in_batch >= cfg.batch_size:
             tracker.batch_pause_start()
             await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
             # Wrap on_tick so the tracker AND telegram progress both update.
-            batch_total = float(limiter.batch_pause_max)  # upper bound for the bar
-            async def _tg_tick_wrapper(remaining: float):
-                tracker.batch_pause_tick(remaining)
-                # Build a snapshot reflecting the active pause.
-                snap = _build_snapshot(tracker, cfg, stop_reason_holder.get("reason", ""))
-                snap.batch_pause_active = True
-                snap.batch_pause_remaining = remaining
-                snap.batch_pause_total = batch_total
-                await tp.update(snap)
-            # We can't make on_tick async (rate_limiter expects sync); so we use a sync wrapper
-            # that schedules the async update on the loop.
+            batch_total = float(limiter.batch_interval_sec)
             loop_ref = asyncio.get_running_loop()
             def _sync_tick(remaining: float):
                 tracker.batch_pause_tick(remaining)
@@ -492,6 +487,10 @@ async def _sweep(
                 asyncio.run_coroutine_threadsafe(tp.update(snap), loop_ref)
             await limiter.batch_pause(on_tick=_sync_tick)
             tracker.batch_pause_end()
+            # Start the NEXT burst timer immediately after the pause ends.
+            limiter.start_burst()
+            print(f"[sweep] starting burst #{tracker.batch_num + 1} "
+                  f"(target: {cfg.batch_size} items in {cfg.batch_interval_sec}s)")
             await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
             if stop_watcher.stop_requested():
                 break

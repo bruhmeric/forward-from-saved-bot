@@ -59,20 +59,22 @@ services:
         value: old
       - key: BATCH_SIZE
         value: "50"
+      # Within-burst delay: 0.5s between sends → 50 items in ~25s.
       - key: PER_MESSAGE_DELAY
-        value: "2.5"
-      - key: BATCH_PAUSE_MIN
-        value: "120"
-      - key: BATCH_PAUSE_MAX
-        value: "180"
+        value: "0.5"
+      # Between-burst interval: 60s between burst STARTS → ~50 items/min throughput.
+      # If a burst takes 25s, we wait 35s; if it takes 70s (FloodWait), we don't wait extra.
+      - key: BATCH_INTERVAL_SEC
+        value: "60"
       # Cap on total Saved Messages scanned per sweep (avoids runaway memory + FloodWait
-      # when Saved Messages is huge). 0 = unlimited. Default 5000 ≈ 10 MB peak RAM.
+      # when Saved Messages is huge). 0 = unlimited. Default 10000 ≈ 20 MB peak RAM.
+      # Lower this if you're hitting Render free-tier RAM limits (512 MB).
       - key: MAX_SCAN
-        value: "5000"
+        value: "10000"
       # Delay (seconds) between get_chat_history pagination calls — prevents Telegram's
       # GetHistory FloodWait penalty (which forces 24s+ waits).
       - key: PAGE_DELAY
-        value: "0.4"
+        value: "0.5"
       - key: PYTHONUNBUFFERED
         value: "1"               # ensures logs stream in real-time on Render
       # Render auto-sets PORT — do not override it here.

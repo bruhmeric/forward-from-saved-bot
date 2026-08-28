@@ -15,10 +15,10 @@ Built to run on **Render's free tier** (web service + StringSession auth). Also 
 3. Skips anything that isn't a photo / video / animation (GIF) per your `--filter` choice.
 4. **Keeps albums together** — multi-photo posts are re-sent as a single `send_media_group` call.
 5. **Strips captions** — every item is forwarded with `caption=""`, so the destination is media-only.
-6. **Conservative rate limiting** — ~2.5s between messages, then a 2-3 minute pause after every 50.
+6. **Burst pacing** — sends 50 items back-to-back (0.5s between each = ~25s burst), then waits until 60s have elapsed since the burst started (~35s idle). Result: steady **~50 items per minute** throughput, which is what Telegram tolerates for sustained bulk sending to a single chat.
 7. **Persists sent IDs** to `state.json` locally. (On Render free tier, this is wiped on redeploy by default — set `USE_TELEGRAM_STATE_SYNC=1` if you want it mirrored to Saved Messages as a document, or upgrade to a paid Disk.)
 8. **Stops on `POST /stop`** — hit the HTTP endpoint, click the Stop button on `/`, press Ctrl+C, or use Render's Suspend button. All halt the bot gracefully after the current item.
-9. After a full sweep, sleeps 5 min and re-scans — so newly saved items get picked up without a restart.
+9. After a full sweep, sleeps 60s and re-scans — so newly saved items are picked up within ~1 minute of you saving them. The auto-resume watermark means only NEW items are fetched on each re-scan (not the entire history).
 10. **Live upload progress in web UI** — every item shows: sweep number, item number, message id, kind (photo/video/animation/album), per-upload byte progress (when a real upload is needed), cumulative totals, and items/min rate. The `/` page auto-refreshes every 10 seconds.
 11. **JSON status API** at `GET /status` for external monitoring (UptimeRobot, custom dashboards, etc.).
 12. **(Optional) Telegram-side live progress** — set `TELEGRAM_PROGRESS=1` to ALSO mirror progress to your Saved Messages. Default OFF.
@@ -250,10 +250,9 @@ In all cases, the bot finishes the current item, saves state (and mirrors it to 
 | `ORDER` | `old` | `new` (newest first) or `old` (oldest first — DEFAULT). Note: `old` loads ALL Saved Messages into memory before forwarding (Pyrogram 2.0.106 doesn't support `reverse=True`). For 10,000+ saved items, raise `MAX_SCAN` or use `ORDER=new` to stream. |
 | `MAX_SCAN` | `5000` | Cap on total Saved Messages collected per sweep (only relevant when `ORDER=old`). `0` = unlimited. Caps memory at ~2 KB × MAX_SCAN. Lower this if you're hitting Render free-tier RAM limits. |
 | `PAGE_DELAY` | `0.4` | Seconds to sleep between `get_chat_history` pagination calls. Telegram rate-limits `GetHistory` to ~30 calls per 30s; without this delay, you'll see `Waiting for 24 seconds before continuing (required by "messages.GetHistory")` spam in logs. |
-| `BATCH_SIZE` | `50` | Items per batch before long pause (1-50) |
-| `PER_MESSAGE_DELAY` | `2.5` | Seconds between individual sends |
-| `BATCH_PAUSE_MIN` | `120` | Min seconds pause after each batch |
-| `BATCH_PAUSE_MAX` | `180` | Max seconds pause after each batch |
+| `BATCH_SIZE` | `50` | Items per burst (1-50) |
+| `PER_MESSAGE_DELAY` | `0.5` | Seconds between sends WITHIN a burst. 50 × 0.5 = 25s burst. Lower = faster burst but higher FloodWait risk (Telegram's per-chat limit is ~20 msg/sec). |
+| `BATCH_INTERVAL_SEC` | `60` | Seconds between burst STARTS. Default 60 → ~50 items/min sustained throughput. If a burst overruns this (e.g. due to FloodWait), no extra pause is added. Must be ≥ 10. |
 | `STOP_POLL_INTERVAL` | `5` | Seconds between Saved Messages polls for `/stop` |
 | `STATE_FILE` | `./state.json` | Path to local sent-IDs state file (ephemeral on free tier) |
 | `PORT` | (Render auto-sets) | HTTP server port — Render injects this automatically |
@@ -488,6 +487,59 @@ curl -X POST https://your-service.onrender.com/reset
 
 ---
 
+## Burst pacing model (~50 items/minute)
+
+The bot sends media in **bursts** rather than trickling one item at a time:
+
+```
+Time →    0s         25s        35s         60s        85s       95s       120s
+         ├───────────┼───────────┼───────────┼──────────┼──────────┼─────────┤
+Burst 1: ████████████████████                          
+         50 items (0.5s each)                          
+                          wait 35s (until 60s elapsed since burst 1 start)
+                                              Burst 2: ████████████████████
+                                                       50 more items
+                                                                wait 35s
+                                                                            ...
+```
+
+### Why burst instead of steady trickle?
+
+- Telegram's rate limit per chat is roughly **30 messages per second burst, 20 msg/min sustained**.
+- Trickle (1 every 1.2s = 50/min) hits the sustained limit AND feels slow.
+- Burst (50 in 25s) is well under the burst limit, then idle for 35s = averages 50/min safely.
+- You get visible progress quickly (50 items land within 25s), then a brief pause, then another burst.
+
+### Tuning the pacing
+
+| Goal | Settings |
+|---|---|
+| Default: ~50 items/min | `BATCH_SIZE=50` `PER_MESSAGE_DELAY=0.5` `BATCH_INTERVAL_SEC=60` |
+| Faster (~100 items/min) | `BATCH_INTERVAL_SEC=30` (keep others same) |
+| Even faster (~150 items/min) | `BATCH_INTERVAL_SEC=20` `PER_MESSAGE_DELAY=0.3` (risky — watch for FloodWait) |
+| Slower & safer (~25 items/min) | `BATCH_INTERVAL_SEC=120` |
+| Maximum throughput per burst | `PER_MESSAGE_DELAY=0.1` (10 msg/sec — at Telegram's per-chat limit) |
+
+> ⚠️ **Don't set `PER_MESSAGE_DELAY` below 0.1** — you'll trigger FloodWait and the bot will be forced to wait 20+ seconds between bursts anyway.
+
+### What happens during a burst pause?
+
+During the ~35s idle between bursts, the bot:
+1. Saves `state.json` (so progress isn't lost on crash)
+2. Updates the web UI's progress display
+3. Checks for stop signals (POST /stop, Ctrl+C, SIGTERM)
+4. Sleeps in 1-second increments so it can react to a stop signal within 1s
+
+You can watch the countdown live at the web UI: `⏸ Batch #1 pause [██████░░░░] 23s remaining`.
+
+### Picking up new items
+
+The bot re-scans Saved Messages every 60s after a sweep completes. With auto-resume, the re-scan only fetches items with `id > last_offset_id` — so if you saved 5 new photos since the last sweep, the next sweep grabs just those 5 (in ~1 second) and forwards them in the next burst cycle.
+
+If you're catching up on a large backlog (e.g. 10,000 saved items), the bot will be busy for ~200 minutes processing the backlog. New items you save during this time will be picked up after the backlog is processed, on the next re-scan.
+
+---
+
 ## How caption stripping works
 
 For **single media**: Pyrogram's `client.copy_message(target, source, msg_id, caption="")` re-sends the same media object with a fresh (empty) caption. No re-download/upload — Telegram server references the original file.
@@ -553,6 +605,12 @@ If you still see it, the cause is one of:
 | **Numeric id missing the `-100` prefix** | For supergroups/channels, the id MUST be in the form `-100<id>` (e.g., `-1001234567890`). Without `-100`, Telegram treats it as a user id. |
 
 The startup logs will show `✓ target resolved: 'channel name' (id=…)` when the peer is successfully resolved, or a friendly error explaining what's wrong.
+
+### `BATCH_PAUSE_MIN` / `BATCH_PAUSE_MAX` env vars on Render
+
+These are **legacy** env vars from an older version of the bot. They are no longer used. The new pacing model uses a single env var: `BATCH_INTERVAL_SEC` (default 60s).
+
+If you have `BATCH_PAUSE_MIN` or `BATCH_PAUSE_MAX` set on Render, **delete them** to avoid confusion. Their values are silently ignored.
 
 ### Other common issues
 
