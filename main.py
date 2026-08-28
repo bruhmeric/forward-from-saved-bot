@@ -94,6 +94,58 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
     return o
 
 
+def _validate_session_string(s: str) -> None:
+    """
+    Pre-flight check on the SESSION_STRING before handing it to Pyrogram.
+
+    Pyrogram v2 StringSessions are ~370 chars, base64url-ish (chars from
+    A–Z a–z 0–9 _ -). We don't decode it fully — just sanity-check the
+    length and character set so we can give a friendly error instead of
+    Pyrogram's cryptic 'struct.error: unpack requires a buffer of 271 bytes'.
+    """
+    if not s:
+        raise SystemExit(
+            "❌ SESSION_STRING is empty. Run `python session_setup.py` locally "
+            "to generate one, then paste the printed string into your env vars."
+        )
+
+    # Pyrogram v2 session strings are typically ~370 chars. v1 is ~290 chars.
+    # Anything < 200 is definitely truncated or wrong format.
+    if len(s) < 200:
+        raise SystemExit(
+            f"❌ SESSION_STRING is too short ({len(s)} chars; expected ~370 for "
+            "Pyrogram v2). It may have been truncated during copy-paste, or generated "
+            "with a different Pyrogram version. Re-run `python session_setup.py`."
+        )
+
+    # If it's still got the 'SESSION_STRING=' prefix, our cleaning didn't catch it
+    # (e.g. value is 'SESSION_STRING=SESSION_STRING=ABC...'). Tell the user.
+    if "SESSION_STRING" in s[:30]:
+        print(f"⚠️  WARNING: SESSION_STRING value starts with 'SESSION_STRING=' prefix.")
+        print(f"    First 30 chars: {s[:30]!r}")
+        print(f"    Render's env var VALUE should contain ONLY the session string,")
+        print(f"    not 'SESSION_STRING=...'. Please re-paste it without the prefix.")
+        raise SystemExit(1)
+
+    # Check character set. Pyrogram v2 uses base64url alphabet (A-Z a-z 0-9 _ -).
+    # Be lenient — allow = for padding just in case.
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-=")
+    bad_chars = set(s) - allowed
+    if bad_chars:
+        sample = "".join(sorted(bad_chars))[:10]
+        raise SystemExit(
+            f"❌ SESSION_STRING contains invalid characters: {sample!r}\n"
+            "    Pyrogram v2 session strings only use A-Z a-z 0-9 _ - = \n"
+            "    This usually means the string was corrupted during copy-paste "
+            "(e.g. line breaks inserted, HTML-escaped, or copy-pasted through a "
+            "rich-text editor). Re-copy from the terminal output of session_setup.py."
+        )
+
+    # All good — print preview for debugging.
+    preview = s[:30] + "…" + s[-10:]
+    print(f"[main] SESSION_STRING looks valid ({len(s)} chars: {preview})")
+
+
 async def amain(cfg: Config, rescan_interval: int) -> int:
     print("[main] config loaded")
     print(f"  target         : {cfg.target}")
@@ -169,8 +221,45 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     signal.signal(signal.SIGINT, _sigint)
     signal.signal(signal.SIGTERM, _sigint)  # Render sends SIGTERM on shutdown
 
+    # Validate the session string format BEFORE attempting to start Pyrogram.
+    # This catches the most common deployment mistake (pasting the value with
+    # the 'SESSION_STRING=' prefix included, or wrapping in quotes, or copying
+    # only part of it) and gives a friendly error instead of a cryptic
+    # 'struct.error: unpack requires a buffer of 271 bytes'.
+    _validate_session_string(cfg.session_string)
+
     print("[main] starting Pyrogram client…")
-    await client.start()
+    try:
+        await client.start()
+    except Exception as e:
+        # Pyrogram raises struct.error / KeyError / ValueError on bad sessions.
+        msg = str(e)
+        print()
+        print("=" * 70)
+        print("❌ FAILED TO START PYROGRAM CLIENT")
+        print("=" * 70)
+        print(f"Error: {type(e).__name__}: {msg}")
+        print()
+        print("This is almost always a SESSION_STRING problem. Common causes:")
+        print()
+        print("  1. SESSION_STRING was generated with a DIFFERENT Pyrogram version")
+        print("     (e.g. v1 vs v2). Re-run `python session_setup.py` locally with")
+        print("     the same pyrogram==2.0.106 version that's in requirements.txt.")
+        print()
+        print("  2. SESSION_STRING was copy-pasted with extra characters (quotes,")
+        print("     'SESSION_STRING=' prefix, trailing whitespace). We auto-strip")
+        print("     common ones, but check the raw env var value on Render.")
+        print()
+        print("  3. SESSION_STRING was truncated (Pyrogram v2 sessions are ~370")
+        print(f"     chars; yours is {len(cfg.session_string)} chars).")
+        print()
+        print("  4. The session was revoked (you logged out, or revoked it from")
+        print("     Telegram's 'Active Sessions' page). Re-generate it.")
+        print()
+        print(f"SESSION_STRING preview (first 30 chars): {cfg.session_string[:30]}…")
+        print("=" * 70)
+        raise SystemExit(1)
+
     me = await client.get_me()
     print(f"[main] connected as {me.first_name} (@{me.username or '—'}) id={me.id}")
 

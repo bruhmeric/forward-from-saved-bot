@@ -83,11 +83,41 @@ The script will print something like:
 
 ```
 ======================================================================
-SESSION_STRING=AB3Def9hBz_zZZ...long_string_here...XYZ
+✅ SESSION_STRING generated successfully!
 ======================================================================
+
+COPY ONLY THE LINE BELOW (no quotes, no 'SESSION_STRING=' prefix):
+
+AQB1dHg6...long_string_here...XYZ
+
+======================================================================
+
+HOW TO USE IT:
+
+  • In Render → Environment → add a new var:
+      Key:   SESSION_STRING
+      Value: <paste the line above, exactly as-is>
+
+  • In local .env:
+      SESSION_STRING=<paste the line above>
+
+DO NOT:
+  ✗ include 'SESSION_STRING=' in the Value field (Render adds that)
+  ✗ wrap it in quotes
+  ✗ add spaces at the start/end
+
+Length: 370 chars · Format: Pyrogram v2 StringSession
 ```
 
-**Copy the entire `SESSION_STRING=...` value** (just the part after `=`) — you'll paste it into Render (or your `.env`).
+### Critical: how to paste into Render's env var
+
+When you create the env var on Render, you have two fields:
+- **Key**: `SESSION_STRING`
+- **Value**: paste the LONG STRING ONLY — **NOT** `SESSION_STRING=ABC123`, just `ABC123`
+
+If you accidentally paste `SESSION_STRING=ABC123` into the Value field, the bot will fail with `struct.error: unpack requires a buffer of 271 bytes`. The bot has built-in auto-cleaning that strips this prefix, but if you still see that error, double-check the raw Value field on Render.
+
+If you're still hitting that error after re-pasting, see the "Troubleshooting" section below.
 
 ---
 
@@ -434,15 +464,33 @@ If a particular Telegram update type doesn't support the `caption=""` override (
 
 ## Troubleshooting
 
+### `struct.error: unpack requires a buffer of 271 bytes`
+
+This is the #1 most common Render deployment error. It means the `SESSION_STRING` env var value is malformed. Causes & fixes:
+
+| Cause | Fix |
+|---|---|
+| **Value includes `SESSION_STRING=` prefix** | Render's env var has two fields: **Key** and **Value**. Put `SESSION_STRING` in Key, and ONLY the long string (no `SESSION_STRING=` prefix) in Value. |
+| **Value is wrapped in quotes** | Render env vars don't need quotes. Remove any `"` or `'` you may have added. |
+| **Value is truncated** | Pyrogram v2 sessions are ~370 chars. If yours is shorter, your terminal may have truncated it during copy-paste. Re-run `session_setup.py` and copy more carefully — try `pbcopy`/`xclip` if available. |
+| **Value has whitespace/newlines** | Some terminals add a trailing newline. The bot auto-strips these, but check the raw Value field on Render. |
+| **Generated with wrong Pyrogram version** | If you ran `session_setup.py` with a different Pyrogram version than `requirements.txt` specifies (pyrogram 2.0.106), the session format won't match. Re-run it inside a fresh `pip install -r requirements.txt` env. |
+| **Session was revoked** | If you logged out from Telegram's "Active Sessions" page or revoked it some other way, regenerate it. |
+
+The bot now prints a friendly diagnostic on Render when this happens, including the session length and a 30-char preview so you can compare it with what `session_setup.py` printed locally.
+
+### Other common issues
+
 | Symptom | Likely cause / fix |
 |---|---|
 | `SESSION_STRING` rejected on Render | Run `session_setup.py` again locally — sessions can expire. |
 | `FloodWait` constantly | Lower `BATCH_SIZE` or raise `PER_MESSAGE_DELAY`. Telegram may also be throttling your account globally. |
 | `PeerIdInvalid` for target | Make sure you've opened the target channel once from your account, or use the `-100…` numeric id. |
 | Bot is running but nothing forwards | Check the `FILTER` — items in Saved Messages that are stickers, voice notes, or documents don't match any filter. |
-| State resets on Render redeploy | Mount a persistent Disk at `/data` and set `STATE_FILE=/data/state.json`. |
+| State resets on Render redeploy | Should not happen — the bot mirrors state to Saved Messages every 60s. If it does, check `USE_TELEGRAM_STATE_SYNC=1` is set and `PROGRESS_CHAT=me`. |
 | Stop command not detected | The watcher only reacts to `/stop` sent **after** the bot started. Older historical `/stop` messages in Saved Messages are ignored. |
 | Album comes through split into single photos | Telegram's album grouping can be lost if any item in the album was forwarded/deleted before fetch. The bot will retry the next sweep. |
+| Service keeps sleeping on free tier | Render free web services sleep after 15 min of no inbound HTTP. Set up UptimeRobot to ping `https://your-service.onrender.com/health` every 10 min. |
 
 ---
 

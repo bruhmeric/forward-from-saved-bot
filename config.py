@@ -81,13 +81,43 @@ def _parse_filter(raw: str) -> Set[str]:
     return set(parts) if parts else {"photo", "video", "animation"}
 
 
+def _clean_session_string(raw: str) -> str:
+    """
+    Defensively clean a SESSION_STRING value.
+
+    Common user mistakes this fixes:
+    - Pasting 'SESSION_STRING=ABC123' (with the prefix) into the Value field
+    - Wrapping in quotes ('\"ABC123\"' or \"'ABC123'\")
+    - Trailing/leading whitespace / newlines
+    - HTML-escaped characters (&amp; &lt; etc.) from copy-paste
+
+    Does NOT validate that the string is a valid Pyrogram session —
+    just removes obvious copy-paste mistakes so Pyrogram has a chance.
+    """
+    s = raw.strip()
+    # Strip an accidental 'SESSION_STRING=' or 'SESSION_STRING:' prefix.
+    for prefix in ("SESSION_STRING=", "SESSION_STRING:",
+                   "session_string=", "session_string:"):
+        if s.startswith(prefix):
+            s = s[len(prefix):].lstrip()
+            break
+    # Strip surrounding quotes if present (single or double, matched pair).
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1]
+    # Strip any trailing newline/whitespace that snuck in.
+    s = s.strip()
+    # Common HTML-escape artifacts from copy-pasting through a web UI:
+    s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return s
+
+
 def from_env(cli_overrides: dict | None = None) -> Config:
     """Build Config from env vars, with optional CLI flag overrides."""
     cli = cli_overrides or {}
 
     api_id_raw = cli.get("api_id") or os.environ.get("API_ID")
     api_hash   = cli.get("api_hash") or os.environ.get("API_HASH") or ""
-    sess       = cli.get("session_string") or os.environ.get("SESSION_STRING") or ""
+    sess       = _clean_session_string(cli.get("session_string") or os.environ.get("SESSION_STRING") or "")
     target     = cli.get("target") or os.environ.get("TARGET") or ""
     filter_raw = cli.get("filter") or os.environ.get("FILTER") or "photo,video,animation"
     order      = (cli.get("order") or os.environ.get("ORDER") or "new").lower()

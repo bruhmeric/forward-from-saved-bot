@@ -11,8 +11,8 @@ You'll be prompted for:
     - Telegram login code (sent to your Telegram app)
     - 2FA password if you have one
 
-The script prints a SESSION_STRING line — paste that into Render's
-Environment tab (or your local .env) as SESSION_STRING=… and you're done.
+The script prints a SESSION_STRING value on its own line. Copy ONLY the
+string (NOT the "SESSION_STRING=" prefix) into Render's Environment tab.
 """
 from __future__ import annotations
 
@@ -47,11 +47,8 @@ async def main() -> None:
         print(f"API_ID must be numeric, got {api_id_str!r}")
         sys.exit(1)
 
-    # Use a fresh in-memory session for export.
-    from pyrogram.session.auth import Auth  # noqa: F401  (sanity check import works)
-
     app = Client(
-        name="session_setup",            # ignored — we use StringSession below
+        name="session_setup",
         api_id=api_id,
         api_hash=api_hash,
         phone_number=phone,
@@ -72,22 +69,42 @@ async def main() -> None:
         me = await app.get_me()
         print(f"\nLogged in as: {me.first_name} (@{me.username or '—'}) id={me.id}")
 
-        # Export the string session.
-        from pyrogram import types  # noqa: F401
-        # Pyrogram 2.x: use await app.export_session_string()
-        try:
-            session_str = await app.export_session_string()
-        except AttributeError:
-            # Older API: session.save() returns the string synchronously.
-            session_str = app.export_session_string()
+        # Pyrogram 2.x: export_session_string() is SYNC, returns str directly.
+        # Do NOT await it — awaiting a str raises TypeError.
+        session_str = app.export_session_string()
 
-        print("\n" + "=" * 70)
-        print("✅ SESSION_STRING (copy this entire line, including the =):")
+        # Verify the session string is well-formed (Pyrogram v2 expects ~370 chars).
+        if not session_str or len(session_str) < 200:
+            print(f"\n⚠️  WARNING: session string looks too short ({len(session_str)} chars). "
+                  "Login may not have completed properly.")
+            sys.exit(1)
+
+        print()
         print("=" * 70)
-        print(f"SESSION_STRING={session_str}")
+        print("✅ SESSION_STRING generated successfully!")
         print("=" * 70)
-        print("\nPaste that into your Render env vars (or local .env).")
-        print("Then deploy the worker — no further login needed.")
+        print()
+        print("COPY ONLY THE LINE BELOW (no quotes, no 'SESSION_STRING=' prefix):")
+        print()
+        print(session_str)
+        print()
+        print("=" * 70)
+        print()
+        print("HOW TO USE IT:")
+        print()
+        print("  • In Render → Environment → add a new var:")
+        print("      Key:   SESSION_STRING")
+        print("      Value: <paste the line above, exactly as-is>")
+        print()
+        print("  • In local .env:")
+        print("      SESSION_STRING=<paste the line above>")
+        print()
+        print("DO NOT:")
+        print("  ✗ include 'SESSION_STRING=' in the Value field (Render adds that)")
+        print("  ✗ wrap it in quotes")
+        print("  ✗ add spaces at the start/end")
+        print()
+        print(f"Length: {len(session_str)} chars · Format: Pyrogram v2 StringSession")
     finally:
         await app.stop()
 
