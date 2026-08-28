@@ -1,0 +1,69 @@
+# Render Background Worker — runs continuously, restarts on crash.
+# Docs: https://render.com/docs/background-workers
+#
+# Deploy via Render Dashboard → New → Background Worker → connect this repo,
+# OR via `render deploy` from CLI with the render-cli.
+#
+# Required env vars (set in Render Dashboard → Environment):
+#   API_ID          — from my.telegram.org
+#   API_HASH        — from my.telegram.org
+#   SESSION_STRING  — from running `python session_setup.py` locally
+#   TARGET          — @channel or -1001234567890
+#
+# Optional (defaults shown):
+#   FILTER=photo,video,animation
+#   ORDER=new
+#   BATCH_SIZE=50
+#   PER_MESSAGE_DELAY=2.5
+#   BATCH_PAUSE_MIN=120
+#   BATCH_PAUSE_MAX=180
+#   STATE_FILE=/data/state.json   ← mount a Render Disk at /data for persistence
+
+services:
+  - type: worker
+    name: tg-bulk-forwarder
+    runtime: python
+    plan: starter               # cheapest paid plan; Render workers require paid
+    region: singapore            # change to your nearest region
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+    envVars:
+      - key: API_ID
+        sync: false             # set in dashboard
+      - key: API_HASH
+        sync: false             # set in dashboard
+      - key: SESSION_STRING
+        sync: false             # set in dashboard
+      - key: TARGET
+        sync: false             # set in dashboard
+      - key: FILTER
+        value: photo,video,animation
+      - key: ORDER
+        value: new
+      - key: BATCH_SIZE
+        value: 50
+      - key: PER_MESSAGE_DELAY
+        value: "2.5"
+      - key: BATCH_PAUSE_MIN
+        value: "120"
+      - key: BATCH_PAUSE_MAX
+        value: "180"
+      - key: STATE_FILE
+        value: /data/state.json  # requires a Render Disk mounted at /data
+      - key: PYTHONUNBUFFERED
+        value: "1"               # ensures logs stream in real-time on Render
+      - key: TELEGRAM_PROGRESS
+        value: "1"               # post live progress to PROGRESS_CHAT
+      - key: PROGRESS_CHAT
+        value: me                # 'me' = Saved Messages; or @username / -100…
+      - key: PROGRESS_UPDATE_INTERVAL
+        value: "5.0"             # seconds between Telegram edits (>=2)
+      # PROGRESS_MESSAGE_ID_FILE defaults to /data/progress_msg_id.txt (next to state.json)
+
+    # OPTIONAL: mount a persistent disk so state.json survives redeploys.
+    # Without this, your sent-id memory resets on each deploy.
+    disk:
+      - name: tgstate
+        mountPath: /data
+        sizeGB: 1                # 1GB is plenty for a JSON file
