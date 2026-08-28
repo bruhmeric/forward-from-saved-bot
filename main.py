@@ -296,11 +296,27 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     print(f"[main] connected as {first_name} (@{username or '—'}) id={uid}")
 
     # CRITICAL: Resolve the target peer BEFORE the forwarder starts sending.
-    # Without this, Telethon doesn't have an access_hash cached for the target
-    # channel/group, and every send will fail with:
-    #   PeerIdInvalidError: The peer id being used is invalid or not known yet.
-    # Calling get_entity() once caches the access_hash in the in-memory session,
-    # so all subsequent forward_messages calls succeed.
+    # StringSession stores NO entity cache, so the first time we use a numeric
+    # id like -1004343021949, Telethon has no access_hash for it and fails
+    # with "Cannot find any entity corresponding to ...".
+    #
+    # Fix: call get_dialogs() once to populate the session cache with all the
+    # user's chats (channels, groups, DMs). After this, get_entity(numeric_id)
+    # works because the access_hash is cached in memory.
+    #
+    # If the target is a @username, get_entity() works without this warmup —
+    # but we do it anyway to also enable replying to /stop and /status commands
+    # sent to Saved Messages from various Telegram clients.
+    print(f"[main] warming up session cache (fetching dialogs)…")
+    try:
+        dialog_count = 0
+        async for _ in client.iter_dialogs():
+            dialog_count += 1
+        print(f"[main] ✓ session cache warmed up: {dialog_count} dialogs indexed")
+    except Exception as e:
+        print(f"[main] WARNING: dialog warmup failed: {e!r}")
+        print("[main] (continuing — target resolution may fail for numeric ids)")
+
     print(f"[main] resolving target peer {cfg.target!r}…")
     try:
         target_entity = await client.get_entity(cfg.target)
@@ -331,6 +347,13 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
         print("     your Telegram app once, then redeploy.")
         print()
         print("  4. For supergroups/channels, the id format MUST be -100<id>")
+        print("     (e.g., -1001234567890). Without the -100 prefix, Telegram")
+        print("     treats it as a user id and resolution fails.")
+        print()
+        print("  5. ⚠️  If you're sure the id is correct and you're a member,")
+        print("     try using the channel's @username instead — some private")
+        print("     channels don't expose their numeric id to the API even")
+        print("     when you're an admin.")
         print()
         raise SystemExit(1)
 
