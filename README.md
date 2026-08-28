@@ -247,7 +247,9 @@ In all cases, the bot finishes the current item, saves state (and mirrors it to 
 | `SESSION_STRING` | — | Pyrogram StringSession from `session_setup.py` (required) |
 | `TARGET` | — | Destination `@username` or `-100…` id (required) |
 | `FILTER` | `photo,video,animation` | Comma-separated subset of {photo, video, animation} |
-| `ORDER` | `old` | `new` (newest first) or `old` (oldest first — DEFAULT). Note: `old` requires loading ALL Saved Messages into memory before forwarding starts (Pyrogram 2.0.106 doesn't support `reverse=True`). For 10,000+ saved items, consider `ORDER=new` to stream. |
+| `ORDER` | `old` | `new` (newest first) or `old` (oldest first — DEFAULT). Note: `old` loads ALL Saved Messages into memory before forwarding (Pyrogram 2.0.106 doesn't support `reverse=True`). For 10,000+ saved items, raise `MAX_SCAN` or use `ORDER=new` to stream. |
+| `MAX_SCAN` | `5000` | Cap on total Saved Messages collected per sweep (only relevant when `ORDER=old`). `0` = unlimited. Caps memory at ~2 KB × MAX_SCAN. Lower this if you're hitting Render free-tier RAM limits. |
+| `PAGE_DELAY` | `0.4` | Seconds to sleep between `get_chat_history` pagination calls. Telegram rate-limits `GetHistory` to ~30 calls per 30s; without this delay, you'll see `Waiting for 24 seconds before continuing (required by "messages.GetHistory")` spam in logs. |
 | `BATCH_SIZE` | `50` | Items per batch before long pause (1-50) |
 | `PER_MESSAGE_DELAY` | `2.5` | Seconds between individual sends |
 | `BATCH_PAUSE_MIN` | `120` | Min seconds pause after each batch |
@@ -445,6 +447,47 @@ The `/` HTML page auto-refreshes every 10 seconds — leave it open in a browser
 
 ---
 
+## Auto-resume (skip already-scanned items)
+
+Every sweep, the bot normally re-scans Saved Messages from the beginning (or from the newest end, depending on `ORDER`). This is wasteful when you have thousands of items — you'd spend minutes re-paginating through items you've already processed.
+
+**Auto-resume** solves this by tracking the **highest Saved Messages `message_id` the bot has processed** (`last_offset_id` in `state.json`). On each new sweep, the bot:
+
+1. Reads `last_offset_id` from `state.json`
+2. Asks Telegram for messages with `id > last_offset_id` only
+3. Updates the watermark after every item (sent OR skipped)
+4. Persists it to `state.json` immediately so a crash mid-sweep doesn't lose progress
+
+This means: if you've already forwarded items 1–5000 and then the bot restarts, the next sweep only fetches items 5001+ — typically just a few pages instead of hundreds.
+
+### Where the watermark lives
+
+- **Locally**: in `state.json` (next to `last_offset_id` field)
+- **On Render free tier**: `state.json` is wiped on redeploy, so the watermark resets too — UNLESS you set `USE_TELEGRAM_STATE_SYNC=1` (mirrors to Saved Messages) OR upgrade to a paid Disk.
+
+### Resetting the watermark
+
+If you want the bot to re-scan from the beginning (e.g., you deleted items from the destination channel and want to re-send them):
+
+**Via web UI:** click the blue **"Reset watermark"** button at `/`
+
+**Via HTTP:**
+```bash
+curl -X POST https://your-service.onrender.com/reset
+```
+
+**Via direct state.json edit:** set `last_offset_id` to `0` in `state.json` and restart.
+
+> Note: resetting the watermark only re-scans from id=1; items already marked as `sent_ids` will still be skipped (idempotency). If you want to FORCE re-sending of everything, delete `state.json` entirely.
+
+### Viewing the current watermark
+
+- **Web UI**: shown at `/` in the Controls card: `last_offset_id=N`
+- **JSON API**: `curl https://your-service.onrender.com/status | jq .last_offset_id`
+- **Logs**: `[sweep] auto-resuming from id > N (last processed in prior sweep)` on each sweep
+
+---
+
 ## How caption stripping works
 
 For **single media**: Pyrogram's `client.copy_message(target, source, msg_id, caption="")` re-sends the same media object with a fresh (empty) caption. No re-download/upload — Telegram server references the original file.
@@ -482,16 +525,31 @@ This is the #1 most common Render deployment error. It means the `SESSION_STRING
 
 The bot now prints a friendly diagnostic on Render when this happens, including the session length and a 30-char preview so you can compare it with what `session_setup.py` printed locally.
 
+### `Waiting for 24 seconds before continuing (required by "messages.GetHistory")`
+
+This is Telegram imposing a `FloodWait` penalty because the bot is calling `get_chat_history` too fast during the initial scan (when `ORDER=old`). Telegram limits `GetHistory` to ~30 calls per 30 seconds per account.
+
+The bot now has a `PAGE_DELAY` env var (default `0.4` seconds) that throttles pagination calls to stay under the limit. If you still see this message:
+
+| Cause | Fix |
+|---|---|
+| `PAGE_DELAY` is `0` or too low | Set `PAGE_DELAY=0.5` or higher in Render env vars. |
+| You have a huge Saved Messages and `MAX_SCAN` is `0` (unlimited) | Set `MAX_SCAN=5000` (or lower) to cap the scan. |
+| Your account was already rate-limited from another client | Wait 5–10 minutes for the limit to clear, then redeploy. |
+
+The `Waiting for 24 seconds…` message itself is **not fatal** — Pyrogram waits the requested time and then retries automatically. But it makes the scan slow. Set `PAGE_DELAY=0.5` to prevent it.
+
 ### Other common issues
 
 | Symptom | Likely cause / fix |
 |---|---|
 | `SESSION_STRING` rejected on Render | Run `session_setup.py` again locally — sessions can expire. |
-| `FloodWait` constantly | Lower `BATCH_SIZE` or raise `PER_MESSAGE_DELAY`. Telegram may also be throttling your account globally. |
+| `FloodWait` constantly during sending | Lower `BATCH_SIZE` or raise `PER_MESSAGE_DELAY`. Telegram may also be throttling your account globally. |
+| `FloodWait` during scan (the `Waiting for N seconds before continuing (required by "messages.GetHistory")` message) | Raise `PAGE_DELAY` to `0.5` or higher, and/or lower `MAX_SCAN`. |
+| Bot collects messages forever without sending | Likely `MAX_SCAN=0` (unlimited) on a huge Saved Messages. Set `MAX_SCAN=5000` to cap. |
 | `PeerIdInvalid` for target | Make sure you've opened the target channel once from your account, or use the `-100…` numeric id. |
 | Bot is running but nothing forwards | Check the `FILTER` — items in Saved Messages that are stickers, voice notes, or documents don't match any filter. |
-| State resets on Render redeploy | Should not happen — the bot mirrors state to Saved Messages every 60s. If it does, check `USE_TELEGRAM_STATE_SYNC=1` is set and `PROGRESS_CHAT=me`. |
-| Stop command not detected | The watcher only reacts to `/stop` sent **after** the bot started. Older historical `/stop` messages in Saved Messages are ignored. |
+| State resets on Render redeploy | Expected behavior by default. Set `USE_TELEGRAM_STATE_SYNC=1` to mirror state to Saved Messages, OR upgrade to a paid Render Disk. |
 | Album comes through split into single photos | Telegram's album grouping can be lost if any item in the album was forwarded/deleted before fetch. The bot will retry the next sweep. |
 | Service keeps sleeping on free tier | Render free web services sleep after 15 min of no inbound HTTP. Set up UptimeRobot to ping `https://your-service.onrender.com/health` every 10 min. |
 

@@ -48,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--per-message-delay", type=float, help="Seconds between individual sends.")
     p.add_argument("--batch-pause-min",  type=int, help="Min pause seconds after each batch.")
     p.add_argument("--batch-pause-max",  type=int, help="Max pause seconds after each batch.")
+    p.add_argument("--max-scan", type=int,
+                   help="Cap on total Saved Messages scanned per sweep (default 5000; 0 = unlimited).")
+    p.add_argument("--page-delay", type=float,
+                   help="Delay (seconds) between get_chat_history pages (default 0.4; prevents FloodWait).")
     p.add_argument("--api-id",     help="Telegram API_ID (or set API_ID env).")
     p.add_argument("--api-hash",   help="Telegram API_HASH (or set API_HASH env).")
     p.add_argument("--session-string", help="Pyrogram StringSession (or set SESSION_STRING env).")
@@ -80,6 +84,8 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
     if args.per_message_delay: o["per_message_delay"] = args.per_message_delay
     if args.batch_pause_min: o["batch_pause_min"]     = args.batch_pause_min
     if args.batch_pause_max: o["batch_pause_max"]      = args.batch_pause_max
+    if args.max_scan:       o["max_scan"]              = args.max_scan
+    if args.page_delay:     o["page_delay"]            = args.page_delay
     if args.api_id:          o["api_id"]              = args.api_id
     if args.api_hash:        o["api_hash"]             = args.api_hash
     if args.session_string:  o["session_string"]       = args.session_string
@@ -154,6 +160,8 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
     print(f"  batch_size     : {cfg.batch_size}")
     print(f"  per_message    : {cfg.per_message_delay}s")
     print(f"  batch_pause    : {cfg.batch_pause_min}-{cfg.batch_pause_max}s")
+    print(f"  max_scan       : {cfg.max_scan if cfg.max_scan > 0 else 'unlimited'}")
+    print(f"  page_delay     : {cfg.page_delay}s")
     print(f"  state_file     : {cfg.state_file}")
     print(f"  tg_progress    : {'on' if cfg.telegram_progress else 'off'} → {cfg.progress_chat!r} (every {cfg.progress_update_interval}s)")
     print(f"  web_server     : http://{cfg.web_host}:{cfg.web_port}")
@@ -213,12 +221,23 @@ async def amain(cfg: Config, rescan_interval: int) -> int:
 
     # Tiny HTTP server — Render free-tier requires binding to $PORT.
     # Constructed now, started after Pyrogram connects.
+    def _reset_watermark():
+        """Reset the auto-resume watermark so next sweep re-scans from id=1."""
+        old = state.last_offset_id
+        state.reset_offset()
+        try:
+            state.save()
+            print(f"[main] auto-resume watermark reset (was {old}, now 0) via HTTP /reset")
+        except Exception as e:
+            print(f"[main] state save after reset failed: {e!r}")
+
     web = WebServer(
         port=cfg.web_port,
         host=cfg.web_host,
         # status_provider is wired after the tracker is created, in run_forwarder.
         status_provider=lambda: {},
         on_stop=stop_watcher.request_stop,
+        on_reset=_reset_watermark,
     )
 
     # Ctrl+C / SIGTERM handler — runs in a separate thread (signal handlers

@@ -65,6 +65,14 @@ services:
         value: "120"
       - key: BATCH_PAUSE_MAX
         value: "180"
+      # Cap on total Saved Messages scanned per sweep (avoids runaway memory + FloodWait
+      # when Saved Messages is huge). 0 = unlimited. Default 5000 ≈ 10 MB peak RAM.
+      - key: MAX_SCAN
+        value: "5000"
+      # Delay (seconds) between get_chat_history pagination calls — prevents Telegram's
+      # GetHistory FloodWait penalty (which forces 24s+ waits).
+      - key: PAGE_DELAY
+        value: "0.4"
       - key: PYTHONUNBUFFERED
         value: "1"               # ensures logs stream in real-time on Render
       # Render auto-sets PORT — do not override it here.

@@ -36,7 +36,13 @@ from web_server import WebServer
 Unit = Tuple[List[int], List[Message]]  # ([msg_id, ...], [Message, ...])
 
 
-async def iter_units(client: Client, order: str) -> AsyncIterator[Unit]:
+async def iter_units(
+    client: Client,
+    order: str,
+    max_scan: int = 5000,
+    page_delay: float = 0.4,
+    start_offset_id: int = 0,
+) -> AsyncIterator[Unit]:
     """
     Yield (ids, messages) units from Saved Messages.
 
@@ -46,24 +52,42 @@ async def iter_units(client: Client, order: str) -> AsyncIterator[Unit]:
 
     Order handling:
       - "new" (newest first): iterate directly via get_chat_history()
-      - "old" (oldest first): collect ALL messages into memory (paginating
-        backward via offset_id), reverse the list, then yield oldest-first.
+      - "old" (oldest first): paginate backward (offset_id) collecting pages,
+        then reverse in memory and yield oldest-first.
 
-        Pyrogram 2.0.106's get_chat_history() does NOT support reverse=True,
-        so for oldest-first we have to materialize the full history in RAM
-        before yielding anything. For typical Saved Messages sizes (a few
-        thousand items) this is fine — each Message object is ~1-2 KB, so
-        10,000 items = ~20 MB peak. If you have hundreds of thousands of
-        saved items, switch to ORDER=new.
+    Pyrogram 2.0.106's get_chat_history() does NOT support reverse=True,
+    so for oldest-first we must materialize the history in RAM.
+
+    Args:
+      max_scan: cap on total messages to collect (0 = unlimited). Default 5000.
+                Caps memory + scan time on huge Saved Messages.
+      page_delay: seconds to sleep between get_chat_history pages.
+                  Telegram rate-limits GetHistory to ~30 calls/30s. Default 0.4s
+                  keeps us under the limit and avoids FloodWait penalties.
+      start_offset_id: AUTO-RESUME watermark — only collect messages with id
+                       STRICTLY GREATER than this value. Pass state.last_offset_id
+                       to skip already-processed items on subsequent sweeps.
+                       0 = collect from the beginning.
     """
     seen_in_session: set[int] = set()
 
     if order == "old":
-        # Collect ALL Saved Messages into a list, paginating backward.
+        # Collect Saved Messages into a list, paginating backward.
+        # Auto-resume: skip messages with id <= start_offset_id (already processed).
         all_msgs: list = []
-        offset_id = 0
+        offset_id = 0  # Pyrogram's offset for pagination (walks backward from newest)
         page_num = 0
-        while True:
+        scan_started_at = time.time()
+        # 0 means unlimited; otherwise cap at max_scan.
+        effective_cap = max_scan if max_scan > 0 else float("inf")
+        hit_cap = False
+        hit_existing_watermark = start_offset_id > 0
+
+        if hit_existing_watermark:
+            print(f"[iter] auto-resume: skipping messages with id ≤ {start_offset_id} "
+                  f"(already processed in prior sweeps)")
+
+        while len(all_msgs) < effective_cap:
             page_num += 1
             page_msgs: list = []
             kwargs = {"limit": 100}
@@ -72,25 +96,63 @@ async def iter_units(client: Client, order: str) -> AsyncIterator[Unit]:
             try:
                 async for m in client.get_chat_history("me", **kwargs):
                     if m is not None:
+                        # Auto-resume: skip already-processed items.
+                        if hit_existing_watermark and m.id <= start_offset_id:
+                            # We've walked back to the watermark — stop scanning.
+                            # (Messages come in newest-first order, so once we hit
+                            # an id <= watermark, everything older is also already done.)
+                            break
                         page_msgs.append(m)
+                        if len(all_msgs) + len(page_msgs) >= effective_cap:
+                            break  # don't over-collect beyond the cap
             except Exception as e:
                 print(f"[iter] get_chat_history page #{page_num} failed (offset_id={offset_id}): {e!r}")
                 break
 
             if not page_msgs:
-                break  # reached the end
+                break  # reached the end OR hit the watermark
+
+            # Trim to the cap if needed.
+            remaining_capacity = effective_cap - len(all_msgs)
+            if remaining_capacity < len(page_msgs):
+                page_msgs = page_msgs[:remaining_capacity]
+                hit_cap = True
 
             all_msgs.extend(page_msgs)
             # offset_id = the LOWEST id in this page; next page returns messages with id < that
             lowest_id = min(m.id for m in page_msgs)
             if lowest_id == offset_id:
-                # No progress — bail to avoid infinite loop.
-                break
+                break  # no progress — bail to avoid infinite loop
             offset_id = lowest_id
-            if page_num % 10 == 0:
-                print(f"[iter] collected {len(all_msgs)} messages so far (page #{page_num})")
 
-        print(f"[iter] collected {len(all_msgs)} total messages; reversing for oldest-first")
+            # If we hit the watermark mid-page, stop scanning further back.
+            if hit_existing_watermark and lowest_id <= start_offset_id:
+                print(f"[iter] reached auto-resume watermark (id={start_offset_id}); "
+                      f"collected {len(all_msgs)} new messages")
+                break
+
+            # Progress log every 5 pages (or every page if cap is close).
+            elapsed = time.time() - scan_started_at
+            rate = len(all_msgs) / elapsed if elapsed > 0 else 0
+            if page_num % 5 == 0 or hit_cap:
+                cap_str = f"/{int(effective_cap)}" if effective_cap != float("inf") else ""
+                print(f"[iter] collected {len(all_msgs)}{cap_str} messages "
+                      f"({page_num} pages, {rate:.0f} msgs/sec, {elapsed:.1f}s elapsed)")
+            if hit_cap:
+                print(f"[iter] hit MAX_SCAN cap of {max_scan}; stopping collection")
+                break
+
+            # Throttle to avoid Telegram's GetHistory FloodWait (~30 calls per 30s).
+            if page_delay > 0:
+                await asyncio.sleep(page_delay)
+
+        if not all_msgs:
+            print(f"[iter] no new messages to process (watermark={start_offset_id}); "
+                  f"nothing to forward this sweep")
+            return
+
+        print(f"[iter] collected {len(all_msgs)} new messages in {page_num} pages "
+              f"({time.time() - scan_started_at:.1f}s); reversing for oldest-first")
         all_msgs.reverse()  # now oldest-first
 
         for m in all_msgs:
@@ -111,9 +173,15 @@ async def iter_units(client: Client, order: str) -> AsyncIterator[Unit]:
         return
 
     # Default path: newest-first (Pyrogram's natural order)
+    count = 0
     async for m in client.get_chat_history("me"):
         if m is None or m.id in seen_in_session:
             continue
+        # Auto-resume: skip already-processed items (newest-first mode).
+        if start_offset_id > 0 and m.id <= start_offset_id:
+            # In newest-first order, once we hit the watermark, everything older is done.
+            print(f"[iter] newest-first: reached watermark id={start_offset_id}; stopping")
+            return
 
         if m.media_group_id:
             try:
@@ -127,6 +195,12 @@ async def iter_units(client: Client, order: str) -> AsyncIterator[Unit]:
         else:
             seen_in_session.add(m.id)
             yield [m.id], [m]
+
+        count += 1
+        # Also respect max_scan in newest-first mode (treat 0 as unlimited).
+        if max_scan > 0 and count >= max_scan:
+            print(f"[iter] newest-first path hit MAX_SCAN cap of {max_scan}; stopping")
+            return
 
 
 # ----------------------------------------------------------------------
@@ -325,13 +399,25 @@ async def _sweep(
     # Initial Telegram progress update for this sweep.
     await tp.force_update(_build_snapshot(tracker, cfg, stop_reason_holder.get("reason", "")))
 
-    async for ids, msgs in iter_units(client, cfg.order):
+    # Auto-resume: pass the last processed message_id as the starting watermark.
+    # iter_units will skip any messages with id ≤ this value (already processed).
+    starting_offset = state.last_offset_id
+    if starting_offset > 0:
+        print(f"[sweep] auto-resuming from id > {starting_offset} (last processed in prior sweep)")
+
+    async for ids, msgs in iter_units(client, cfg.order,
+                                      max_scan=cfg.max_scan,
+                                      page_delay=cfg.page_delay,
+                                      start_offset_id=starting_offset):
         if stop_watcher.stop_requested():
             print("[forwarder] stop signal received — halting")
             break
 
         # Idempotency: skip if ALL ids already sent.
         if all(state.was_sent(i) for i in ids):
+            # Update offset watermark even for skipped items so we don't re-visit.
+            for i in ids:
+                state.update_offset_id(i)
             continue
 
         # Filter: at least one message in the unit must match the filter set.
@@ -339,6 +425,9 @@ async def _sweep(
         matching = [m for m in msgs if is_match(m, cfg.filter_types)]
         if not matching:
             tracker.item_skipped(ids[0], f"none of {len(msgs)} items match filter")
+            # Still advance the offset watermark so we don't re-scan this item.
+            for i in ids:
+                state.update_offset_id(i)
             continue
 
         # Determine kind label for progress display.
@@ -459,6 +548,7 @@ async def run_forwarder(
             "stopped": snap.stopped,
             "stop_reason": snap.stop_reason,
             "state_sent_ids_count": len(state.sent_ids),
+            "last_offset_id": state.last_offset_id,
         }
     web.status_provider = _web_status_provider
 

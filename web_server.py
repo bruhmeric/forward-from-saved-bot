@@ -34,12 +34,14 @@ class WebServer:
         host: str = "0.0.0.0",
         status_provider: Optional[Callable[[], dict]] = None,
         on_stop: Optional[Callable[[], None]] = None,
+        on_reset: Optional[Callable[[], None]] = None,
         html_renderer: Optional[Callable[[], str]] = None,
     ) -> None:
         self.port = int(port)
         self.host = host
         self.status_provider = status_provider or (lambda: {})
         self.on_stop = on_stop or (lambda: None)
+        self.on_reset = on_reset  # may be None
         self.html_renderer = html_renderer
         self._server: Optional[asyncio.AbstractServer] = None
         self._started_at = time.time()
@@ -152,6 +154,19 @@ class WebServer:
                              "not implemented yet — use /stop\n")
             return
 
+        if path == "/reset" and method in ("POST", "GET"):
+            # Reset the auto-resume watermark so the next sweep re-scans from the beginning.
+            if self.on_reset is not None:
+                try:
+                    self.on_reset()
+                    msg = "✅ auto-resume watermark reset — next sweep will re-scan from id=1\n"
+                except Exception as e:
+                    msg = f"reset failed: {e}\n"
+            else:
+                msg = "reset handler not configured\n"
+            await self._send(writer, 200, "text/plain", msg)
+            return
+
         if path == "/favicon.ico" and method == "GET":
             await self._send(writer, 204, "text/plain", "")
             return
@@ -197,6 +212,8 @@ class WebServer:
         upload_current = int(snap.get("upload_current", 0))
         batch_pause = bool(snap.get("batch_pause_active"))
         batch_remaining = float(snap.get("batch_pause_remaining", 0))
+        last_offset_id = int(snap.get("last_offset_id", 0))
+        state_sent_count = int(snap.get("state_sent_ids_count", 0))
 
         upload_html = ""
         if upload_active and upload_total:
@@ -273,11 +290,18 @@ class WebServer:
       <button onclick="if(confirm('Stop the bot?')) fetch('/stop',{{method:'POST'}}).then(()=>location.reload())">
         Stop bot
       </button>
+      <button style="background:#1976d2" onclick="if(confirm('Reset auto-resume watermark? Next sweep will re-scan from id=1 (items already marked sent will still be skipped).')) fetch('/reset',{{method:'POST'}}).then(()=>location.reload())">
+        Reset watermark
+      </button>
+    </p>
+    <p class="meta">
+      Auto-resume watermark: <code>last_offset_id={last_offset_id}</code>
+      ({state_sent_count} items marked sent in state.json)
     </p>
     <p class="meta">
       Also available:
-      <code>curl -X POST {html.escape("$HOST/stop")}</code>
-      or send <code>/stop</code> to your Saved Messages.
+      <code>curl -X POST .../stop</code> ·
+      <code>curl -X POST .../reset</code>
     </p>
   </div>
 

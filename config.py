@@ -37,6 +37,11 @@ class Config:
     # State
     state_file: str
 
+    # Scan limit — caps total messages collected per sweep when ORDER=old
+    # (avoids runaway memory + FloodWait when Saved Messages is huge)
+    max_scan: int = 5000                # 0 = unlimited
+    page_delay: float = 0.4            # delay between get_chat_history pages (avoids FloodWait)
+
     # Telegram-side live progress reporter (defaults OFF — web UI is the primary interface)
     telegram_progress: bool = False       # post live progress to a chat
     progress_chat: str = "me"             # 'me' = Saved Messages, or @username / -100…
@@ -74,6 +79,10 @@ class Config:
         if self.state_sync_interval_sec < 30:
             # Telegram rate-limits sending documents; keep >= 30s to be safe.
             raise ValueError("STATE_SYNC_INTERVAL_SEC must be >= 30 seconds")
+        if self.max_scan < 0:
+            raise ValueError("MAX_SCAN must be >= 0 (0 = unlimited)")
+        if self.page_delay < 0 or self.page_delay > 10:
+            raise ValueError("PAGE_DELAY must be between 0 and 10 seconds")
 
 
 def _parse_filter(raw: str) -> Set[str]:
@@ -127,6 +136,8 @@ def from_env(cli_overrides: dict | None = None) -> Config:
     bp_max     = int(cli.get("batch_pause_max") or os.environ.get("BATCH_PAUSE_MAX") or "180")
     stop_int   = int(cli.get("stop_poll_interval") or os.environ.get("STOP_POLL_INTERVAL") or "5")
     state_file = cli.get("state_file") or os.environ.get("STATE_FILE") or "./state.json"
+    max_scan   = int(cli.get("max_scan") or os.environ.get("MAX_SCAN") or "5000")
+    page_delay = float(cli.get("page_delay") or os.environ.get("PAGE_DELAY") or "0.4")
 
     # Telegram-side live progress (defaults OFF — web UI is the primary interface)
     tp_raw     = (cli.get("telegram_progress") or os.environ.get("TELEGRAM_PROGRESS") or "0").strip().lower()
@@ -174,6 +185,8 @@ def from_env(cli_overrides: dict | None = None) -> Config:
         batch_pause_max=bp_max,
         stop_poll_interval=stop_int,
         state_file=state_file,
+        max_scan=max_scan,
+        page_delay=page_delay,
         telegram_progress=telegram_progress,
         progress_chat=progress_chat,
         progress_update_interval=progress_interval,
