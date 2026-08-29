@@ -1,0 +1,68 @@
+# Docker Compose — runs both Telegram bots + dashboard on a single VPS
+#
+# Services:
+#   1. forwarder-bot     — the Telegram Forwarder Bot (polling mode)
+#   2. saved-forwarder   — the forward-from-saved-bot (from bruhmeric/forward-from-saved-bot)
+#   3. dashboard         — unified web dashboard showing both bots' stats
+#
+# Ports exposed on the VPS:
+#   - 8080: Dashboard web UI (http://YOUR_VPS_IP:8080)
+#   - 10000: Saved-forwarder's built-in web UI (http://YOUR_VPS_IP:10000)
+#
+# Both bots' stats servers are internal (Docker network only, not exposed).
+#
+# Setup:
+#   1. Run ./setup.sh to clone the second bot and configure .env files
+#   2. docker-compose up -d
+#   3. Open http://YOUR_VPS_IP:8080 for the dashboard
+
+services:
+  forwarder-bot:
+    build:
+      context: ./telegram-forwarder-bot
+      dockerfile: Dockerfile
+    container_name: forwarder-bot
+    env_file:
+      - ./telegram-forwarder-bot/.env
+    restart: unless-stopped
+    volumes:
+      - forwarder-data:/app/data
+    networks:
+      - bots-network
+
+  saved-forwarder:
+    build:
+      context: ./forward-from-saved-bot
+      dockerfile: ../saved-forwarder.Dockerfile
+    container_name: saved-forwarder
+    env_file:
+      - ./forward-from-saved-bot/.env
+    ports:
+      - "10000:10000"
+    restart: unless-stopped
+    volumes:
+      - saved-forwarder-data:/app/data
+    networks:
+      - bots-network
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - forwarder-bot
+      - saved-forwarder
+    networks:
+      - bots-network
+
+volumes:
+  forwarder-data:
+  saved-forwarder-data:
+
+networks:
+  bots-network:
+    driver: bridge
